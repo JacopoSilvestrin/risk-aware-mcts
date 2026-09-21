@@ -116,7 +116,13 @@ def simulate_accrued_MCTS(env, H, erm_beta, n_iter_per_timestep=1_000):
     cumulative_cost = 0.0
     for t in tqdm(range(H)):
 
+        # Planning draws from the same np.random stream as the real env step; restore the
+        # RNG state afterwards so the real transition depends only on prior real steps
+        # (not on n_iter_per_timestep or on which tree shape the algorithm explored).
+        np_state = np.random.get_state()
         mcts.learn(n_iters=n_iter_per_timestep)
+        np.random.set_state(np_state)
+
         selected_action = mcts.best_action()
 
         # Environment step.
