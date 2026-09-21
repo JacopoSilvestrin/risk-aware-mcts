@@ -19,7 +19,8 @@ Notation: `C` is the (discounted) cost, `beta` is `erm_beta`, and the entropic r
 | 5 | `algos/erm_mcts.py` | `best_action()` picks lowest ERM (`min_erm`), with legacy flag | Design fix | Yes |
 | 6 | `algos/erm_mcts.py` | Log-sum-exp ERM estimator (`_estimate_erm`) | Numerical | No |
 | 7 | `algos/erm_backward_induction.py` | Log-sum-exp Q-values | Numerical | No |
-| 8 | `simulate_mcts_accrued_costs.py` | Clip `exp(beta * cost)` (`_safe_exp`) | Numerical | Only at large beta |
+| 8 | `simulate_mcts_accrued_costs.py` | Clip `exp(beta * cost)` (`_safe_exp`); mitigation with a caveat, see section 8 | Numerical | Only at large beta |
+| 9 | `simulate_erm_mcts.py`, `simulate_mcts_accrued_costs.py` | Save/restore `np.random` state around `mcts.learn()` | Experiment design | Yes (per-seed trajectories) |
 
 "Real bug" means the old code did something unintended. "Design fix" means the old code did what
 it said, but the choice was statistically unsound for a risk-sensitive objective.
@@ -122,6 +123,32 @@ long horizons.
 first child always wins. The exponent is now clipped at `MAX_EXP_ARG = 700` via `_safe_exp`. The `MCTS(...)`
 calls in this file also pass `erm_beta` (fix 2).
 
+**Trade-off (this is a mitigation, not an exact fix).** After clipping, every accrued cost above
+`700 / beta` produces the identical terminal reward. At large beta this can make a branch with a rare
+catastrophic cost look *better* than a branch with a smaller but certain cost, because both saturate at
+`exp(700)` while the rare one is averaged with cheap outcomes. For example at beta=15 every cost above
+about 46.7 clips to the same value. ROBOT's `TAIL_WIDENING_INVESTIGATION.md` identifies this as a real,
+beta-dependent bias and left it unfixed. It is still better than the original behaviour (`inf` poisoning the
+tree), and it only matters when `beta * cost` reaches about 700, which the default configs here do not.
+`ERMMCTS` and `ERMBackwardInduction` are not affected, since they use log-sum-exp (fixes 6 and 7).
+
+## 9. RNG isolation between planning and real steps (`simulate_erm_mcts.py`, `simulate_mcts_accrued_costs.py`)
+
+**Problem.** `mcts.learn()` calls `env.step()` on the same env object, and therefore the same global
+`np.random` stream, that the real per-timestep transition uses. How much randomness planning consumes depends
+on `n_iter_per_timestep` and on which tree shape each algorithm explores. So the real transition at step `t`
+depended on the planning budget and on the algorithm: two runs with the same seed did *not* face the same
+real trajectory, which confounds ERM-MCTS vs acc-MCTS comparisons.
+
+**Fix.** Save `np.random.get_state()` before `mcts.learn(...)` and restore it afterwards. The real
+transition now depends only on earlier real steps. (ROBOT also saves the Python `random` state, because its
+bin-packing env uses it; this repo's envs only use `np.random`.)
+
+**Effect.** This is an experiment-design fix, not an algorithm change, but it changes the per-seed trajectories,
+so it is another reason old and new numbers are not directly comparable. In the scratch check, the RNG
+trace at each decision point was identical for 50 vs 200 iterations with the fix, and different without it,
+for both algorithms.
+
 ---
 
 ## Intentionally NOT ported
@@ -143,8 +170,11 @@ calls in this file also pass `erm_beta` (fix 2).
 * **`np.log(-mean_reward)`** in `MCTS._estimate_erm` requires a visited node to have a strictly negative mean
   reward. That holds for the accrued-cost wrapper (every visit ends in a `-exp(...) < 0` terminal reward). A
   different env wrapper that returns 0 or positive terminal rewards would break it.
-* **Results will change.** Fixes 1-5 alter search behaviour, so any numbers produced with the previous code
-  are not directly comparable with new runs.
+* **Exponent clipping bias.** The `_safe_exp` clip (fix 8) saturates every cost above `700 / beta`, which can
+  favour a rare-catastrophe branch over a smaller certain cost at large beta. Only acc-mcts is affected; it was
+  left unfixed in ROBOT as well.
+* **Results will change.** Fixes 1-5 alter search behaviour and fix 9 alters per-seed trajectories, so any
+  numbers produced with the previous code are not directly comparable with new runs.
 
 ## How it was checked
 
@@ -156,6 +186,8 @@ Scratch script (not in the repo), on `four_state_mdp` / `two_paths_mdp`, with `R
 * `MCTS`: no random node has a positive `cumulative_reward` after the fix (the original code did); at beta=10
   all `cumulative_reward` values stay finite; `_safe_exp(3000)` is finite.
 * `simulate_erm_mcts.simulate_ERM_MCTS` and `simulate_mcts_accrued_costs.simulate_accrued_MCTS` run end to end.
+* RNG isolation: the `np.random` state at each decision point is identical for `n_iter_per_timestep` = 50 vs
+  200 with the fix, and differs without it, for both algorithms.
 
 This is a smoke and consistency check, not a statistical re-validation of the algorithms. To compare
 old and new behaviour on a metric that matters to you, re-run your experiments on both the `master` and
