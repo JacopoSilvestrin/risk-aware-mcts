@@ -91,14 +91,21 @@ class MCTS:
             - available_actions that receives a state and returns a list with
                 the available actions for that state.
     :param K_ucb: (float) exporation parameter of UCB
+    :param erm_beta: (float) risk-sensitivity parameter used by the accrued-cost wrapper env
+            to compute the terminal reward as -exp(erm_beta*accrued_cost). Needed here (not
+            just in the env) to read that reward back out in cost units via _estimate_erm(),
+            so the UCB objective stays commensurate with the exploration bonus. No gamma/
+            depth-decay is needed: unlike ERM-MCTS's recursive Bellman/ERM decomposition,
+            acc-mcts applies beta exactly once, to the total accrued cost, at termination.
     :param rollout_policy: (func) policy to perform rollouts.
             If None then rollout policy is random.
 
     Adapted from https://github.com/martinobdl/MCTS
     """
-    def __init__(self, initial_state, env, K_ucb, rollout_policy=None):
+    def __init__(self, initial_state, env, K_ucb, erm_beta, rollout_policy=None):
         self.K_ucb = K_ucb
         self.env = env
+        self.erm_beta = erm_beta
         self.rollout_policy = rollout_policy
 
         # Create tree.
@@ -135,8 +142,8 @@ class MCTS:
             # Generate the next decision node (next state).
             (new_decision_node, r) = self.select_outcome(random_node)
 
-            # Store reward in random node.
-            random_node.reward = r
+            # Store reward in random node (negate cost -> reward, consistent with rollout()).
+            random_node.reward = -r
 
             # Add next decision node to random node children. Internally checks whether
             # the created next_decision_node (next state) already exists in tree; if it
@@ -157,6 +164,23 @@ class MCTS:
             random_node.visits += 1
             decision_node = random_node.father
 
+    def _estimate_erm(self, node: RandomNode):
+        """
+        Empirical ERM cost estimate (1/beta)*log(mean(exp(beta*cost))), read back out of
+        this node's existing reward accumulator instead of a raw cost list. Valid because
+        acc-mcts's reward is always -exp(erm_beta*cost) at termination and 0 at every
+        intermediate step (see grow_tree()/rollout()'s sign convention), so
+        cumulative_reward/visits == -mean(exp(erm_beta*cost)) for any visited node. Keeping
+        this in cost units (rather than the raw exp-scale reward) is what lets the UCB
+        exploration bonus actually compete with the objective instead of being permanently
+        dwarfed by it.
+
+        :param node: (RandomNode) node to estimate, must have node.visits > 0.
+        :return: (float) empirical ERM cost estimate.
+        """
+        mean_reward = node.cumulative_reward / node.visits
+        return (1.0 / self.erm_beta) * np.log(-mean_reward)
+
     def select(self, x: DecisionNode):
         """
         Selects the action to play from the current decision node.
@@ -165,9 +189,10 @@ class MCTS:
         :return: (int) action.
         """
         def scoring(k):
-            if x.children[k].visits > 0:
-                return x.children[k].cumulative_reward/x.children[k].visits + \
-                    self.K_ucb*np.sqrt(np.sqrt(x.visits)/x.children[k].visits)
+            child = x.children[k]
+            if child.visits > 0:
+                return -self._estimate_erm(child) + \
+                    self.K_ucb*np.sqrt(np.sqrt(x.visits)/child.visits)
             else:
                 return np.inf
 
@@ -225,14 +250,17 @@ class MCTS:
 
     def best_action(self):
         """
-        Returns the most visited action.
+        Returns the root action with the lowest empirical ERM cost estimate (no exploration
+        bonus -- this is the final commit, not tree search). Mirrors ERMMCTS's "min_erm"
+        criterion: since this objective is tail-dominated, visit counts don't reliably track
+        ERM ranking the way they would for an expected-value objective.
 
-        :return: (int) the best action according to the number of visits principle.
+        :return: (int) the selected action.
         """
-        number_of_visits_children = [node.visits for node in self.root.children.values()]
-        index_best_action = np.argmax(number_of_visits_children)
+        children = list(self.root.children.values())
+        erms = [self._estimate_erm(node) if node.visits > 0 else np.inf for node in children]
 
-        return list(self.root.children.values())[index_best_action].action
+        return children[np.argmin(erms)].action
     
     def update_root_node(self, selected_action : int, new_state : dict):
         """
