@@ -66,13 +66,32 @@ class RandomNode:
 
 class ERMMCTS:
 
-    def __init__(self, initial_state, env, K_ucb, erm_beta, rollout_policy=None, root_depth=0):
+    def __init__(self, initial_state, env, K_ucb, erm_beta, rollout_policy=None, root_depth=0,
+                    best_action_criterion="min_erm", risk_neutral_beta_threshold=1e-6):
+        """
+        :param best_action_criterion: (str) how best_action() picks the root action once the
+            tree is grown. "min_erm" (default): the action with the lowest empirical ERM
+            (correct for this risk-sensitive objective). "most_visited": the action visited
+            most during tree search (legacy criterion, valid for expected-value MCTS but not
+            for ERM -- kept only so old results can be reproduced for comparison).
+        :param risk_neutral_beta_threshold: (float or None) when erm_beta <= this threshold,
+            best_action() uses "most_visited" regardless of best_action_criterion. In this
+            near-risk-neutral regime ERM_beta(C) ~= E[C] + O(beta), so "min_erm" degenerates
+            into raw min-mean-cost selection with no confidence/visit-count adjustment -- the
+            classic "max child" MCTS pitfall of being fooled by an under-sampled but luckily
+            low-cost branch, which visit-count-based selection is more robust to. Pass None to
+            disable the override and always use best_action_criterion literally (e.g. for
+            controlled criterion-comparison experiments at low beta).
+        """
+        assert best_action_criterion in ("min_erm", "most_visited")
 
         self.K_ucb = K_ucb
         self.env = env
         self.rollout_policy = rollout_policy
         self.erm_beta = erm_beta
-        self.root_depth = 0
+        self.root_depth = root_depth
+        self.best_action_criterion = best_action_criterion
+        self.risk_neutral_beta_threshold = risk_neutral_beta_threshold
 
         # Create tree.
         self.root = self.init_tree(initial_state)
@@ -136,6 +155,24 @@ class ERMMCTS:
             random_node.visits += 1
             decision_node = random_node.father
 
+    def _estimate_erm(self, costs, depth: int):
+        """
+        Numerically stable empirical Entropic Risk Measure of a list of observed
+        discounted costs (Log-Sum-Exp trick), at the given tree depth.
+
+        :param costs: (array-like) observed cumulative discounted costs.
+        :param depth: (int) depth of the node the costs were collected at (controls
+            how much erm_beta has decayed via gamma**depth).
+        :return: (float) empirical ERM.
+        """
+        costs = np.array(costs)
+        N = len(costs)
+        beta_depth = self.erm_beta * self.env.gamma**depth
+
+        beta_costs = beta_depth * costs
+        max_val = np.max(beta_costs)
+        return (1.0/beta_depth) * (-np.log(N) + max_val + np.log(np.sum(np.exp(beta_costs - max_val))))
+
     def select(self, x: DecisionNode, depth: int):
         """
         Selects the action to play from the current decision node.
@@ -147,10 +184,7 @@ class ERMMCTS:
         """
         def scoring(k):
             if x.children[k].visits > 0:
-                costs = np.array(x.children[k].costs_list)
-                N = len(costs)
-                beta_depth = self.erm_beta * self.env.gamma**depth
-                erm = (1.0/beta_depth) * np.log((1.0/N) * np.sum(np.exp(beta_depth*costs)))
+                erm = self._estimate_erm(x.children[k].costs_list, depth)
                 return erm - self.K_ucb * np.sqrt( np.sqrt(x.visits) / x.children[k].visits)
             else:
                 return -np.inf
@@ -211,14 +245,38 @@ class ERMMCTS:
 
     def best_action(self):
         """
-        Returns the most visited action.
+        Returns the root action to commit to, according to self.best_action_criterion:
+        - "min_erm": the action with the lowest empirical ERM (no exploration bonus --
+          this is the final commit, not tree search). Correct criterion for this
+          risk-sensitive objective, since ERM is dominated by tail behavior and visit
+          counts don't reliably track ERM ranking (unlike expected-value MCTS, where
+          visit counts do track mean-value ranking).
+        - "most_visited": the most-visited child, regardless of its empirical ERM.
+          Legacy criterion (valid for expected-value MCTS, not for ERM) kept only to
+          reproduce old results.
 
-        :return: (int) the best action according to the number of visits principle.
+        Regardless of the above, if erm_beta <= self.risk_neutral_beta_threshold (and the
+        threshold isn't None), "most_visited" is used unconditionally -- see the constructor
+        docstring for why.
+
+        :return: (int) the selected action.
         """
-        number_of_visits_children = [node.visits for node in self.root.children.values()]
-        index_best_action = np.argmax(number_of_visits_children)
+        children = list(self.root.children.values())
 
-        return list(self.root.children.values())[index_best_action].action
+        criterion = self.best_action_criterion
+        if self.risk_neutral_beta_threshold is not None and self.erm_beta <= self.risk_neutral_beta_threshold:
+            criterion = "most_visited"
+
+        if criterion == "most_visited":
+            visits = [node.visits for node in children]
+            return children[np.argmax(visits)].action
+
+        # "min_erm"
+        erms = [
+            self._estimate_erm(node.costs_list, self.root_depth) if node.visits > 0 else np.inf
+            for node in children
+        ]
+        return children[np.argmin(erms)].action
     
     def update_root_node(self, selected_action : int, new_state : dict):
         """
