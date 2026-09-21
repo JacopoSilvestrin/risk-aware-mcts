@@ -39,7 +39,17 @@ class NumpyEncoder(json.JSONEncoder):
         elif isinstance(obj, np.ndarray):
             return obj.tolist()
         return json.JSONEncoder.default(self, obj)
-    
+
+
+MAX_EXP_ARG = 700.0  # np.exp overflows to inf above ~709.78 (float64); 700 leaves
+                      # headroom for cumulative_reward to sum many such terminal
+                      # visits (n_iter_per_timestep up to ~1e4) before approaching
+                      # float64's max (~1.8e308).
+
+def _safe_exp(beta_times_cost):
+    """np.exp with the exponent clipped so it can never overflow to inf."""
+    return np.exp(np.minimum(beta_times_cost, MAX_EXP_ARG))
+
 
 class AccruedCosts_MDP:
 
@@ -78,7 +88,7 @@ class AccruedCosts_MDP:
             print("cost:", self.mdp["C"][state_t, a])
 
         if next_timestep == self.H:
-            cost = np.exp(self.erm_beta * next_accrued_cost)
+            cost = _safe_exp(self.erm_beta * next_accrued_cost)
             terminated = True
         else:
             cost = 0.0
@@ -100,7 +110,7 @@ def simulate_accrued_MCTS(env, H, erm_beta, n_iter_per_timestep=1_000):
 
     K_ucb = np.sqrt(2)
 
-    mcts = MCTS(initial_state=extended_state, env=env, K_ucb=K_ucb, rollout_policy=None)
+    mcts = MCTS(initial_state=extended_state, env=env, K_ucb=K_ucb, erm_beta=erm_beta, rollout_policy=None)
 
     # Simulate until termination.
     cumulative_cost = 0.0
@@ -116,7 +126,7 @@ def simulate_accrued_MCTS(env, H, erm_beta, n_iter_per_timestep=1_000):
         updated_root = mcts.update_root_node(selected_action, extended_state)
         if not updated_root:
             # Next state is not present in the tree - build a new tree.
-            mcts = MCTS(initial_state=extended_state, env=env, K_ucb=K_ucb, rollout_policy=None)
+            mcts = MCTS(initial_state=extended_state, env=env, K_ucb=K_ucb, erm_beta=erm_beta, rollout_policy=None)
 
     print("final discounted cumulative cost:", cumulative_cost)
 
