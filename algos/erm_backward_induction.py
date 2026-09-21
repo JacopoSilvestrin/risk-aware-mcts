@@ -25,8 +25,10 @@ class ERMBackwardInduction(object):
                 Q_vals = []
                 for action in self.mdp["actions"]:
                     
-                    exp_next_states = np.dot(self.mdp["P"][action][state], np.exp(beta_t * (self.mdp["C"][state][action] + self.gamma * V_func[t+1,:])) )
-                    Q_vals.append((1.0/beta_t) * np.log(exp_next_states))
+                    x = beta_t * (self.mdp["C"][state][action] + self.gamma * V_func[t+1,:])
+                    max_val = np.max(x)
+                    exp_next_states = np.dot(self.mdp["P"][action][state], np.exp(x - max_val))
+                    Q_vals.append((1.0/beta_t) * (max_val + np.log(exp_next_states)))
 
                 V_func[t,state] = np.min(Q_vals)
                 policy[t,state] = np.argmin(Q_vals)
