@@ -18,14 +18,20 @@ Output layout (one folder per (env, algo, beta, n_iter) "cell"):
                              so merge_exps.py and the notebooks (json.loads(json.load(f))["f_vals"]) keep working
             run.log          one line per episode: seed, f_val, seconds
 
-Seeding: episode i of EVERY cell uses seed 1000 * base_seed + i (independent of env, algo, beta, n_iter), and
-np.random.seed(seed) is called inside the worker at the start of the episode. f_vals[i] therefore refers to the
-same seed in every cell. Planning never consumes the real-step random stream (see the RNG isolation in
-simulate_erm_mcts.py / simulate_mcts_accrued_costs.py), so all algorithms also share the same initial state and the
-same random numbers for the real transitions.
+Environments (SWEEP["envs"]): env name -> horizon H, or a dict {"H": ..., "gamma": ..., <env kwargs>}.
+  - any name in envs.envs.MDPs (explicit MDPs; gamma comes from the MDP; all three algorithms available)
+  - "binpacking": envs/binpacking_env_sequential.BinPackingEnv (gamma default 1, extra keys such as "num_bags" go to
+    the constructor; no explicit MDP, so "erm-bi" is skipped for it)
 
-Note: K_ucb (sqrt(2)) and the ERM-MCTS best-action criterion ("min_erm") are the defaults hard-coded in the
-simulate_* scripts this runner reuses; they are not swept here.
+Seeding: episode i of EVERY cell uses seed 1000 * base_seed + i (independent of env, algo, beta, n_iter), and both
+np.random and Python's random are seeded inside the worker at the start of the episode. f_vals[i] therefore refers to
+the same seed in every cell. Planning never consumes the real-step random streams (both are saved/restored around
+every mcts.learn()), so all algorithms share the same initial state and, on the MDPs, the same random numbers for the
+real transitions. On "binpacking" the item sequence is shared, but crush/spill draws (np.random inside step) only
+happen on some branches, so those are only partly common across algorithms.
+
+Note: K_ucb (sqrt(2)) and the ERM-MCTS best-action criterion ("min_erm") are fixed defaults here; they are not swept.
+The MCTS episode loops below mirror simulate_erm_mcts.py / simulate_mcts_accrued_costs.py but work for any env.
 """
 
 import argparse
@@ -36,6 +42,7 @@ import logging
 import multiprocessing as mp
 import os
 import pathlib
+import random
 import subprocess
 import sys
 import time
@@ -45,9 +52,11 @@ from datetime import datetime
 import numpy as np
 
 from algos.erm_backward_induction import ERMBackwardInduction
+from algos.erm_mcts import ERMMCTS
+from algos.mcts import MCTS
+from envs.binpacking_env_sequential import BinPackingEnv
 from envs.envs import get_env, MDPs
-from simulate_erm_mcts import simulate_ERM_MCTS
-import simulate_mcts_accrued_costs as acc
+import simulate_mcts_accrued_costs as acc  # AccruedCosts_MDP, _safe_exp, NumpyEncoder
 
 DATA_FOLDER_PATH = str(pathlib.Path(__file__).parent / "data") + "/"
 
@@ -55,7 +64,10 @@ ALGOS = ("erm-mcts", "acc-mcts", "erm-bi")
 
 SWEEP = {
     "name": "demo",
-    "envs": {"four_state_mdp": 20, "two_paths_mdp": 15},  # env name -> horizon H
+    # env name -> horizon H, or {"H": ..., "gamma": ..., <env kwargs>} (see module docstring)
+    "envs": {"four_state_mdp": 20,
+             "two_paths_mdp": 15,
+             "binpacking": {"H": 5, "gamma": 1, "num_bags": 5}},
     "algos": ["erm-mcts", "acc-mcts", "erm-bi"],
     "erm_betas": [0.1, 0.5, 1.0],
     "n_iters": [100, 500, 2000],  # n_iter_per_timestep (ignored by "erm-bi", which runs once per (env, beta))
@@ -69,22 +81,58 @@ SWEEP = {
 # Cells
 # --------------------------------------------------------------------------------------
 
+BINPACKING = "binpacking"
+
+
+def env_kind(name):
+    """"mdp" for explicit MDPs from envs.envs.MDPs, "binpacking" for BinPackingEnv."""
+    return "binpacking" if name == BINPACKING else "mdp"
+
+
+def parse_env_spec(env, spec):
+    """SWEEP["envs"][env] (an int H, or a dict {"H", "gamma", <env kwargs>}) -> (H, gamma, env_kwargs)."""
+    if env_kind(env) == "mdp" and env not in MDPs:
+        raise ValueError(f"unknown env {env!r}; available: {list(MDPs) + [BINPACKING]}")
+    if isinstance(spec, dict):
+        kwargs = dict(spec)
+        if "H" not in kwargs:
+            raise ValueError(f"env {env!r}: the spec dict needs an 'H' (horizon) key")
+        H, gamma = kwargs.pop("H"), kwargs.pop("gamma", None)
+    else:
+        H, gamma, kwargs = spec, None, {}
+
+    if env_kind(env) == "mdp":
+        if kwargs:
+            raise ValueError(f"env {env!r} is an explicit MDP and takes no extra options: {sorted(kwargs)}")
+        if gamma is not None and gamma != MDPs[env]["gamma"]:
+            raise ValueError(f"env {env!r} has gamma={MDPs[env]['gamma']} built in; got gamma={gamma}")
+        gamma = MDPs[env]["gamma"]
+    elif gamma is None:
+        gamma = 1  # BinPackingEnv default
+    return H, gamma, kwargs
+
+
 def cell_name(cell):
     n_iter = "NA" if cell["n_iter"] is None else cell["n_iter"]
-    return (f"{cell['env']}_{cell['algo']}_gamma_{cell['gamma']}_beta_{cell['erm_beta']}"
+    name = (f"{cell['env']}_{cell['algo']}_gamma_{cell['gamma']}_beta_{cell['erm_beta']}"
             f"_niter_{n_iter}_H_{cell['H']}")
+    for key, value in sorted(cell["env_kwargs"].items()):  # e.g. _num_bags_5, so bag counts never collide
+        name += f"_{key}_{value}"
+    return name
 
 
 def expand_cells(cfg):
     """Cartesian product env x algo x beta x n_iter. "erm-bi" ignores n_iter, so it gets a single
-    cell (n_iter=None) per (env, beta) instead of identical re-runs."""
+    cell (n_iter=None) per (env, beta) instead of identical re-runs, and only exists for explicit MDPs."""
     cells = []
-    for env, H in cfg["envs"].items():
-        gamma = MDPs[env]["gamma"]
+    for env, spec in cfg["envs"].items():
+        H, gamma, env_kwargs = parse_env_spec(env, spec)
         for algo, beta in itertools.product(cfg["algos"], cfg["erm_betas"]):
+            if algo == "erm-bi" and env_kind(env) != "mdp":
+                continue
             n_iters = [None] if algo == "erm-bi" else cfg["n_iters"]
             for n_iter in n_iters:
-                cell = {"env": env, "H": H, "gamma": gamma, "algo": algo,
+                cell = {"env": env, "H": H, "gamma": gamma, "env_kwargs": env_kwargs, "algo": algo,
                         "erm_beta": beta, "n_iter": n_iter}
                 cell["name"] = cell_name(cell)
                 cells.append(cell)
@@ -92,9 +140,8 @@ def expand_cells(cfg):
 
 
 def validate(cfg):
-    for env in cfg["envs"]:
-        if env not in MDPs:
-            raise ValueError(f"unknown env {env!r}; available: {list(MDPs)}")
+    for env, spec in cfg["envs"].items():
+        parse_env_spec(env, spec)
     for algo in cfg["algos"]:
         if algo not in ALGOS:
             raise ValueError(f"unknown algo {algo!r}; available: {ALGOS}")
@@ -103,6 +150,102 @@ def validate(cfg):
 # --------------------------------------------------------------------------------------
 # One episode (runs inside a worker process)
 # --------------------------------------------------------------------------------------
+
+def build_env(cell):
+    """The raw (unwrapped) environment of a cell."""
+    if env_kind(cell["env"]) == "binpacking":
+        return BinPackingEnv(num_items_to_pack=cell["H"], gamma=cell["gamma"], **cell["env_kwargs"])
+    return get_env(cell["env"], cell["H"])
+
+
+class AccruedCosts_Env:
+    """Accrued-cost wrapper for acc-mcts around any env that has no explicit MDP (e.g. BinPackingEnv).
+    The state carries accrued_costs; the reward is 0 until termination, then exp(beta * accrued_costs)
+    (exponent clipped, see simulate_mcts_accrued_costs._safe_exp)."""
+
+    def __init__(self, env, erm_beta):
+        self.env = env
+        self.gamma = env.gamma
+        self.erm_beta = erm_beta
+
+    def available_actions(self, state):
+        return self.env.available_actions(state)
+
+    def sample_initial_state(self):
+        state = self.env.sample_initial_state()
+        state["accrued_costs"] = 0.0
+        return state
+
+    def step(self, extended_state, a):
+        next_state, cost, terminated = self.env.step(extended_state, a)
+        next_accrued_cost = extended_state["accrued_costs"] + self.gamma ** extended_state["t"] * cost
+        next_state["accrued_costs"] = next_accrued_cost
+        if terminated:
+            return next_state, acc._safe_exp(self.erm_beta * next_accrued_cost), True
+        return next_state, 0.0, False
+
+
+def build_accrued_env(cell):
+    """The env acc-mcts plans in: accrued-cost augmented, terminal reward exp(beta * accrued cost)."""
+    if env_kind(cell["env"]) == "binpacking":
+        return AccruedCosts_Env(build_env(cell), cell["erm_beta"])
+    return acc.AccruedCosts_MDP(MDPs[cell["env"]], cell["H"], cell["erm_beta"])
+
+
+def _isolated_learn(mcts, n_iters):
+    """mcts.learn() with both RNG streams restored afterwards, so planning never consumes the random
+    numbers the real environment steps use (Python's random for items, np.random for the rest)."""
+    py_state = random.getstate()
+    np_state = np.random.get_state()
+    mcts.learn(n_iters=n_iters)
+    random.setstate(py_state)
+    np.random.set_state(np_state)
+
+
+def simulate_erm_mcts(env, H, erm_beta, n_iter):
+    """One ERM-MCTS episode; returns the discounted cumulative cost."""
+    K_ucb = np.sqrt(2)
+
+    def new_tree(state, root_depth):
+        return ERMMCTS(initial_state=state, env=env, K_ucb=K_ucb, erm_beta=erm_beta,
+                       rollout_policy=None, root_depth=root_depth)
+
+    state = env.sample_initial_state()
+    mcts = new_tree(state, 0)
+    total = 0.0
+    for t in range(H):
+        _isolated_learn(mcts, n_iter)
+        action = mcts.best_action()
+        state, cost, terminated = env.step(state, action)
+        total += cost * env.gamma ** t
+        if terminated:
+            break
+        if mcts.update_root_node(action, state):
+            mcts.set_root_depth(t + 1)
+        else:
+            mcts = new_tree(state, t + 1)  # next state not in the tree: rebuild it
+    return total
+
+
+def simulate_acc_mcts(env, H, erm_beta, n_iter):
+    """One acc-mcts episode on the accrued-cost env; returns the discounted cumulative cost."""
+    K_ucb = np.sqrt(2)
+
+    def new_tree(state):
+        return MCTS(initial_state=state, env=env, K_ucb=K_ucb, erm_beta=erm_beta, rollout_policy=None)
+
+    state = env.sample_initial_state()
+    mcts = new_tree(state)
+    for t in range(H):
+        _isolated_learn(mcts, n_iter)
+        action = mcts.best_action()
+        state, _, terminated = env.step(state, action)
+        if terminated:
+            break
+        if not mcts.update_root_node(action, state):
+            mcts = new_tree(state)
+    return state["accrued_costs"]
+
 
 def _rollout_bi_policy(env, H, policy):
     """Roll out a precomputed backward-induction policy (same loop/discounting as the simulate_* scripts)."""
@@ -119,19 +262,18 @@ def run_episode(args):
     cell, seed, bi_policy = args
     t0 = time.time()
     np.random.seed(seed)
-    env_name, H, beta, n_iter = cell["env"], cell["H"], cell["erm_beta"], cell["n_iter"]
+    random.seed(seed)
+    H, beta, n_iter = cell["H"], cell["erm_beta"], cell["n_iter"]
 
-    # The reused simulate_* functions print and draw tqdm bars; keep worker output out of the logs.
+    # Keep any stray prints from the envs/algorithms out of the worker output.
     with open(os.devnull, "w") as devnull, \
             contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
         if cell["algo"] == "erm-mcts":
-            f_val = simulate_ERM_MCTS(env=get_env(env_name, H), H=H, erm_beta=beta,
-                                      n_iter_per_timestep=n_iter)
+            f_val = simulate_erm_mcts(build_env(cell), H, beta, n_iter)
         elif cell["algo"] == "acc-mcts":
-            f_val = acc.simulate_accrued_MCTS(env=acc.get_env(env_name, H, beta), H=H, erm_beta=beta,
-                                              n_iter_per_timestep=n_iter)
+            f_val = simulate_acc_mcts(build_accrued_env(cell), H, beta, n_iter)
         else:  # erm-bi
-            f_val = _rollout_bi_policy(get_env(env_name, H), H, bi_policy)
+            f_val = _rollout_bi_policy(build_env(cell), H, bi_policy)
 
     return seed, float(f_val), time.time() - t0
 
@@ -189,7 +331,7 @@ def run_cell(pool, cell, cell_dir, seeds):
     if cell["algo"] == "erm-bi":
         # Computed once per cell (the policy does not depend on the episode seed).
         with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull):
-            bi_policy = ERMBackwardInduction(get_env(cell["env"], cell["H"]),
+            bi_policy = ERMBackwardInduction(build_env(cell),
                                              cell["erm_beta"], cell["H"]).compute()
 
     t0 = time.time()
@@ -266,6 +408,10 @@ def main(cfg, data_folder_path=None, resume_dir=None):
     logger.info(f"sweep dir: {sweep_dir}")
     logger.info(f"{len(cells)} cells x {cfg['N']} episodes = {len(cells) * cfg['N']} episodes; "
                 f"seeds {seeds[0]}..{seeds[-1]} shared by every cell; {cfg['num_processors']} processes")
+    if "erm-bi" in cfg["algos"]:
+        for env in cfg["envs"]:
+            if env_kind(env) != "mdp":
+                logger.info(f"erm-bi skipped for {env!r}: no explicit MDP (backward induction needs P and C)")
 
     with mp.Pool(processes=cfg["num_processors"]) as pool:
         for k, cell in enumerate(cells, 1):

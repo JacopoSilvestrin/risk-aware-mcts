@@ -17,10 +17,25 @@ python run_experiments.py --base-seed 3            # another shared set of episo
 python run_experiments.py --resume data/sweep_...  # finish an interrupted sweep (its saved config is used)
 ```
 
+**Environments.** `SWEEP["envs"]` maps an env name to its horizon `H`, or to a dict `{"H": ..., "gamma": ..., ...}`:
+
+```python
+"envs": {"four_state_mdp": 20,                                         # any name in envs.envs.MDPs
+         "binpacking": {"H": 5, "gamma": 1, "num_bags": 5}},           # envs/binpacking_env_sequential.py
+```
+
+Extra keys (such as `num_bags`) are passed to the `BinPackingEnv` constructor and appended to the cell folder name
+(`..._H_5_num_bags_5`). MDPs have their own `gamma` built in and take no extra keys. `erm-bi` (exact backward
+induction) needs explicit transition/cost tables, so it is only run on the MDPs and skipped, with a log line, for
+`binpacking`.
+
 **Seeding.** Episode `i` of every cell uses seed `1000 * base_seed + i`, whatever the env, algorithm, beta or
-`n_iter`. So `f_vals[i]` is the same seeded episode in every cell (same initial state, same random numbers for the
-real transitions), and cells can be compared per seed. `erm-bi` (exact backward induction) does not use `n_iter`, so
-it runs once per (env, beta).
+`n_iter`. So `f_vals[i]` is the same seeded episode in every cell, and cells can be compared per seed. Both
+`np.random` and Python's `random` are seeded, and both are restored after each planning phase, so planning never
+consumes the random numbers of the real transitions. On the MDPs the initial state and all real transitions'
+random numbers are shared by every algorithm. On `binpacking` the initial state and the item sequence are shared,
+but the crush/spill draws only happen on some branches, so those are only partly shared between algorithms.
+`erm-bi` does not use `n_iter`, so it runs once per (env, beta).
 
 **Output.** One folder per cell under `data/sweep_<name>_<timestamp>_seed<base_seed>/`:
 
