@@ -67,7 +67,7 @@ class RandomNode:
 class ERMMCTS:
 
     def __init__(self, initial_state, env, K_ucb, erm_beta, rollout_policy=None, root_depth=0,
-                    best_action_criterion="min_erm", risk_neutral_beta_threshold=1e-6):
+                    best_action_criterion="most_visited", risk_neutral_beta_threshold=1e-6):
         """
         :param best_action_criterion: (str) how best_action() picks the root action once the
             tree is grown. "min_erm" (default): the action with the lowest empirical ERM

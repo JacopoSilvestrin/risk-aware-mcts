@@ -24,7 +24,7 @@ TEMPERATURE_MAP = {
 #      "broken into" with 4 pre-existing items once), a full H-step episode's cumulative cost
 #      is then at most ~1 too. If num_bags or the worst-case scenario above ever changes,
 #      recompute this bound.
-_STEP_COST_NORMALIZATION = 200.0
+_STEP_COST_NORMALIZATION = 100.0
 
 ILLEGAL_MOVE_COST  = 100.0 / _STEP_COST_NORMALIZATION  # volume/weight constraint violation
 CRUSH_COST         = 50.0 / _STEP_COST_NORMALIZATION    # per fragile item crushed

@@ -65,12 +65,12 @@ ALGOS = ("erm-mcts", "acc-mcts", "erm-bi")
 SWEEP = {
     "name": "demo",
     # env name -> horizon H, or {"H": ..., "gamma": ..., <env kwargs>} (see module docstring)
-    "envs": {"four_state_mdp": 20, #ALWAYS USE H=20 FOR GRID-MDP
+    "envs": {#"four_state_mdp": 20, #ALWAYS USE H=20 FOR GRID-MDP
              #"two_paths_mdp": 15, #ALWAYS USE H=15 FOR GRID-MDP
-             #"binpacking": {"H": 5, "gamma": 1, "num_bags": 5}
+             "binpacking": {"H": 5, "gamma": 1, "num_bags": 5}
              },
-    "algos": ["erm-mcts", "acc-mcts", "erm-bi"],
-    "erm_betas": [0.001, 10, 20, 30, 50],
+    "algos": ["erm-mcts"], #["erm-mcts", "acc-mcts", "erm-bi"],
+    "erm_betas": [0.001, 1, 25],
     "n_iters": [2000],  # n_iter_per_timestep (ignored by "erm-bi", which runs once per (env, beta))
     "N": 100,                     # episodes per cell
     "base_seed": 0,
