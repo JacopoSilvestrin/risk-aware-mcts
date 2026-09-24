@@ -46,3 +46,19 @@ but the crush/spill draws only happen on some branches, so those are only partly
 | `sweep.log` | sweep-level log (also printed to stdout) |
 | `<env>_<algo>_gamma_<g>_beta_<b>_niter_<n>_H_<H>/exp_data.json` | `config`, `f_vals`, `seeds`, ... in the same format as the `simulate_*` scripts, so `merge_exps.py` and the notebooks work unchanged |
 | `<cell>/run.log` | one line per episode: seed, f_val, seconds |
+
+## Running a sweep on Slurm
+
+`run_sweep_slurm.sh` submits `run_experiments.py` as one Slurm job. Run it from the repo checkout on the cluster
+after editing `SWEEP`:
+
+```
+./run_sweep_slurm.sh                                         # 50 CPUs, partition gaips_phd, 96h
+./run_sweep_slurm.sh --cpus 32 --time 48:00:00 --mem 64G --base-seed 3 --name highbeta
+./run_sweep_slurm.sh --resume data/sweep_demo_...            # finish a sweep that hit the time limit
+```
+
+The job copies the repo to `/scratch/slurm-jobs/$SLURM_JOB_ID`, builds a venv from `requirements.txt`, and runs with
+`--num-processors $SLURM_CPUS_PER_TASK`, so the pool size always matches the CPUs requested. Results go straight to
+`--data-dir` (default `<repo>/data`) on the shared filesystem, and the job's stdout goes to
+`slurm_logs/sweep-<jobid>.out`.

@@ -65,12 +65,13 @@ ALGOS = ("erm-mcts", "acc-mcts", "erm-bi")
 SWEEP = {
     "name": "demo",
     # env name -> horizon H, or {"H": ..., "gamma": ..., <env kwargs>} (see module docstring)
-    "envs": {"four_state_mdp": 20,
-             "two_paths_mdp": 15,
-             "binpacking": {"H": 5, "gamma": 1, "num_bags": 5}},
+    "envs": {"four_state_mdp": 20, #ALWAYS USE H=20 FOR GRID-MDP
+             #"two_paths_mdp": 15, #ALWAYS USE H=15 FOR GRID-MDP
+             #"binpacking": {"H": 5, "gamma": 1, "num_bags": 5}
+             },
     "algos": ["erm-mcts", "acc-mcts", "erm-bi"],
-    "erm_betas": [0.1, 0.5, 1.0],
-    "n_iters": [100, 500, 2000],  # n_iter_per_timestep (ignored by "erm-bi", which runs once per (env, beta))
+    "erm_betas": [0.001, 10, 20, 30, 50],
+    "n_iters": [2000],  # n_iter_per_timestep (ignored by "erm-bi", which runs once per (env, beta))
     "N": 100,                     # episodes per cell
     "base_seed": 0,
     "num_processors": 8,
@@ -161,7 +162,7 @@ def build_env(cell):
 class AccruedCosts_Env:
     """Accrued-cost wrapper for acc-mcts around any env that has no explicit MDP (e.g. BinPackingEnv).
     The state carries accrued_costs; the reward is 0 until termination, then exp(beta * accrued_costs)
-    (exponent clipped, see simulate_mcts_accrued_costs._safe_exp)."""
+    (see simulate_mcts_accrued_costs._safe_exp)."""
 
     def __init__(self, env, erm_beta):
         self.env = env
@@ -374,7 +375,7 @@ def _print_table(logger, manifest):
                     f"{c['mean']:>12.4f}{c['std']:>10.4f}{c['erm']:>12.4f}")
 
 
-def main(cfg, data_folder_path=None, resume_dir=None):
+def main(cfg, data_folder_path=None, resume_dir=None, num_processors=None):
     data_folder_path = data_folder_path or DATA_FOLDER_PATH
     now = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 
@@ -383,6 +384,8 @@ def main(cfg, data_folder_path=None, resume_dir=None):
         with open(os.path.join(sweep_dir, "sweep_config.json")) as f:
             sweep_meta = json.load(f)
         cfg = sweep_meta["sweep"]  # keep the original config so seeds/cells stay coherent
+        if num_processors:  # a machine setting, not part of the experiment: may differ on resume
+            cfg = {**cfg, "num_processors": num_processors}
         sweep_meta.setdefault("resumed_at", []).append(now)
     else:
         sweep_dir = os.path.join(data_folder_path, f"sweep_{cfg['name']}_{now}_seed{cfg['base_seed']}")
@@ -446,6 +449,8 @@ if __name__ == "__main__":
     parser.add_argument("--data-folder", help="where to create the sweep folder (default: ./data/)")
     parser.add_argument("--resume", metavar="SWEEP_DIR",
                         help="continue an interrupted sweep: finished cells are skipped and the SAVED config is used")
+    parser.add_argument("--num-processors", type=int,
+                        help="override SWEEP['num_processors'] (also applies with --resume)")
     args = parser.parse_args()
 
     cfg = dict(SWEEP)
@@ -453,4 +458,6 @@ if __name__ == "__main__":
         cfg["base_seed"] = args.base_seed
     if args.name:
         cfg["name"] = args.name
-    main(cfg, data_folder_path=args.data_folder, resume_dir=args.resume)
+    if args.num_processors:
+        cfg["num_processors"] = args.num_processors
+    main(cfg, data_folder_path=args.data_folder, resume_dir=args.resume, num_processors=args.num_processors)
