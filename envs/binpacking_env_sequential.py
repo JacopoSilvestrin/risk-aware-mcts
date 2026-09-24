@@ -13,11 +13,24 @@ TEMPERATURE_MAP = {
 # Cost constants — tune these to calibrate accident signal vs. packing noise.
 # Illegal move reduced so it doesn't completely swamp accident variance during rollouts.
 # Crush/spill raised so a single accident is visible on the scale of packing-reward differences.
-ILLEGAL_MOVE_COST  = 100.0   # volume/weight constraint violation
-CRUSH_COST         = 50.0   # per fragile item crushed
-SPILL_COST         = 40.0   # base cost per spill event
-CONTAMINATION_COST = 10.0   # added per spill-vulnerable item already in bag when spill occurs
-BAG_OPEN_COST      = 10.0    # charged once when the first item is placed in a previously empty bag
+#
+# Two normalization stages, both derived from these raw numbers:
+#   1. Per-step (below): a single step's cost is at most 1. The worst case for
+#      num_bags=5 is the last item landing on top of 4 already-packed fragile items in the
+#      same bag and crushing all of them (4 * 50.0 = 200, the raw CRUSH_COST above), so every
+#      raw cost below is divided by that bound.
+#   2. Per-episode (BinPackingEnv.__init__, which divides these by self.H): assuming every
+#      step hits that same per-step worst case (it can't, in practice, since a bag can only be
+#      "broken into" with 4 pre-existing items once), a full H-step episode's cumulative cost
+#      is then at most ~1 too. If num_bags or the worst-case scenario above ever changes,
+#      recompute this bound.
+_STEP_COST_NORMALIZATION = 200.0
+
+ILLEGAL_MOVE_COST  = 100.0 / _STEP_COST_NORMALIZATION  # volume/weight constraint violation
+CRUSH_COST         = 50.0 / _STEP_COST_NORMALIZATION    # per fragile item crushed
+SPILL_COST         = 40.0 / _STEP_COST_NORMALIZATION    # base cost per spill event
+CONTAMINATION_COST = 10.0 / _STEP_COST_NORMALIZATION    # added per spill-vulnerable item already in bag when spill occurs
+BAG_OPEN_COST      = 10.0 / _STEP_COST_NORMALIZATION    # charged once when the first item is placed in a previously empty bag
 
 class Item:
     def __init__(self, id, name, est_weight_g, est_volume_cc, crush_score, category, temperature, spill_risk, spill_vulnerable, orientation_sensitive, is_crushed=False, risk_level=0.0, is_spilled=False, spill_risk_level=0.0):
@@ -171,6 +184,17 @@ class BinPackingEnv(Env):
         self.num_items_to_pack = num_items_to_pack
         self.gamma = gamma
         self.H = num_items_to_pack # Horizon is exactly the number of items to pack
+
+        # Per-episode cost scale: divide the (already per-step-normalized) module-level
+        # costs by H, so a full episode's cumulative cost is at most ~1 (see the comment
+        # above the module-level constants). Instance attributes, not module constants,
+        # because H is configurable per BinPackingEnv instance.
+        self.illegal_move_cost  = ILLEGAL_MOVE_COST / self.H
+        self.crush_cost         = CRUSH_COST / self.H
+        self.spill_cost         = SPILL_COST / self.H
+        self.contamination_cost = CONTAMINATION_COST / self.H
+        self.bag_open_cost      = BAG_OPEN_COST / self.H
+
         self.items_data = ITEMS_DATA
         self.debug = debug
         self.debug_items = DEBUG_ITEMS_DATA
@@ -226,7 +250,7 @@ class BinPackingEnv(Env):
         if bag.volume_used + item.volume > bag.MAX_VOLUME or \
              bag.weight_used + item.weight > bag.MAX_WEIGHT:
              illegal_move = True
-             cost_t += ILLEGAL_MOVE_COST
+             cost_t += self.illegal_move_cost
 
         if not illegal_move:
              # Make state transition
@@ -234,7 +258,7 @@ class BinPackingEnv(Env):
              bag.weight_used += item.weight
              bag.total_items += 1
              if bag.total_items == 1:
-                 cost_t += BAG_OPEN_COST
+                 cost_t += self.bag_open_cost
 
              # Risk contribution from putting items on top of fragile/sensitive items
              # 1. Update risk for each fragile item ALREADY in the bag
@@ -250,7 +274,7 @@ class BinPackingEnv(Env):
                      fail_prob = min(packed_item.risk_level * 0.05, 1.0) #0.003
                      if np.random.rand() < fail_prob:
                          packed_item.is_crushed = True
-                         cost_t += CRUSH_COST
+                         cost_t += self.crush_cost
 
              # 2. Update spill risk for each spill-risk item ALREADY in the bag.
              # Adding a new item josttles the bag; the tighter the bag, the higher the chance of
@@ -268,13 +292,13 @@ class BinPackingEnv(Env):
                      if np.random.rand() < fail_prob:
                          packed_item.is_spilled = True
                          bag.spilled_count += 1
-                         cost_t += SPILL_COST
+                         cost_t += self.spill_cost
                          # Extra contamination cost for each spill-vulnerable item already in the bag
                          contaminated = sum(
                              1 for it in bag.items
                              if it.spill_vulnerable and not it.is_crushed and it is not packed_item
                          )
-                         cost_t += CONTAMINATION_COST * contaminated
+                         cost_t += self.contamination_cost * contaminated
 
              # 3. Add new item to bag
              bag.items.append(item.copy())
@@ -289,17 +313,6 @@ class BinPackingEnv(Env):
              if item.orientation_sensitive:
                  bag.orientation_sensitive_count += 1
                  
-             # Global fill efficiency: average fill ratio across active bags.
-             # Opening a new bag dilutes this, discouraging unnecessary bag use.
-             num_active = sum(1 for b in bags if b.total_items > 0)
-             R_packing = sum(b.volume_used for b in bags) / (num_active * Bag.MAX_VOLUME)
-
-             # Combine to form reward
-             reward = R_packing
-             
-             # We are returning a cost, so we add a negative reward and a positive step cost
-             cost_t += -reward
-        
         # Build next extended state
         next_t = t + 1
         if self.debug:

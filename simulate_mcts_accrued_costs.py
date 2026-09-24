@@ -41,14 +41,11 @@ class NumpyEncoder(json.JSONEncoder):
         return json.JSONEncoder.default(self, obj)
 
 
-MAX_EXP_ARG = 700.0  # np.exp overflows to inf above ~709.78 (float64); 700 leaves
-                      # headroom for cumulative_reward to sum many such terminal
-                      # visits (n_iter_per_timestep up to ~1e4) before approaching
-                      # float64's max (~1.8e308).
-
 def _safe_exp(beta_times_cost):
-    """np.exp with the exponent clipped so it can never overflow to inf."""
-    return np.exp(np.minimum(beta_times_cost, MAX_EXP_ARG))
+    """np.exp, unclipped (experiment: overflow guard removed now that episode costs are
+    normalized to ~[0, 1] for binpacking, so beta*cost is expected to stay far below the
+    float64 overflow threshold ~709.78)."""
+    return np.exp(beta_times_cost)
 
 
 class AccruedCosts_MDP:

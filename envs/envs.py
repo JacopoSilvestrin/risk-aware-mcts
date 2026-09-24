@@ -127,7 +127,7 @@ MDPs = {
     "four_state_mdp": {
         "states": [0, 1, 2, 3],
         "actions": [0, 1], # Action 0 = left, action 1 = right
-        "gamma": 0.9,
+        "gamma": 1,
         "p_0": [1.0, 0.0, 0.0, 0.0],
         "P": np.array([
             [
@@ -146,7 +146,7 @@ MDPs = {
         "C": np.array([[0.0, 0.0], # c=0 / 20.
                        [0.25, 0.25], # c=5 / 20.
                        [0.05, 0.05], # c=1 / 20.
-                       [1.0, 1.0]]) # c=20 / 20.
+                       [1.0, 1.0]]) / 20 # c=20 / 20. EVERYTHING DIVIDED BY H=20
     },
     "obstacle_mdp": {
         "states": states,
@@ -440,7 +440,7 @@ delta=0.01
 
 rng = np.random.default_rng(seed=6)
 
-g = 0.99
+g = 1
 
 n_states = ncols * nrows + 1 # Here we add one absorbing state
 states = list(range(n_states))
@@ -484,7 +484,7 @@ slippery_states = np.array([
  [False, False, False]])
 
 # Costs
-C = np.ones((n_states, n_actions)) # default cost = 1
+C = np.ones((n_states, n_actions)) / (pit_cost * 15) # default cost = 1 / max cost * H
 
 # Transitions
 P = np.zeros((n_actions, n_states, n_states))
@@ -520,7 +520,7 @@ for s in states:
         C[s,:] = 2'''
 
     if s == pitfall:
-        C[s, :] = pit_cost
+        C[s, :] = pit_cost / (pit_cost * 15) # default cost = 1 / max cost * H
         P[:, s, s] = 1
         continue
 
