@@ -261,22 +261,33 @@ class ERMMCTS:
 
         :return: (int) the selected action.
         """
-        children = list(self.root.children.values())
-
         criterion = self.best_action_criterion
         if self.risk_neutral_beta_threshold is not None and self.erm_beta <= self.risk_neutral_beta_threshold:
             criterion = "most_visited"
 
-        if criterion == "most_visited":
-            visits = [node.visits for node in children]
-            return children[np.argmax(visits)].action
+        return self.root_action_stats()[criterion]
 
-        # "min_erm"
+    def root_action_stats(self):
+        """
+        The root children's statistics and the action each best_action() criterion would pick,
+        so both candidates can be logged whichever one is executed. Uses no randomness.
+
+        :return: (dict) "actions", "visits" and "erms" (empirical ERM at root_depth, None if
+            unvisited), one entry per root child, plus the "most_visited" and "min_erm" actions.
+        """
+        children = list(self.root.children.values())
+        visits = [node.visits for node in children]
         erms = [
             self._estimate_erm(node.costs_list, self.root_depth) if node.visits > 0 else np.inf
             for node in children
         ]
-        return children[np.argmin(erms)].action
+        return {
+            "actions": [node.action for node in children],
+            "visits": visits,
+            "erms": [float(e) if np.isfinite(e) else None for e in erms],
+            "most_visited": children[np.argmax(visits)].action,
+            "min_erm": children[np.argmin(erms)].action,
+        }
     
     def update_root_node(self, selected_action : int, new_state : dict):
         """

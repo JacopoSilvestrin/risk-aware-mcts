@@ -46,6 +46,7 @@ but the crush/spill draws only happen on some branches, so those are only partly
 | `sweep.log` | sweep-level log (also printed to stdout) |
 | `<env>_<algo>_gamma_<g>_beta_<b>_niter_<n>_H_<H>/exp_data.json` | `config`, `f_vals`, `seeds`, ... in the same format as the `simulate_*` scripts, so `merge_exps.py` and the notebooks work unchanged |
 | `<cell>/run.log` | one line per episode: seed, f_val, seconds |
+| `<cell>/decisions.jsonl` | `erm-mcts` only: one JSON line per episode with, at every step, the executed, most-visited and min-ERM root actions, whether the last two agree, and each root action's visits and empirical ERM. `manifest.json` also gets the disagreement count and rate |
 
 ## Running a sweep on Slurm
 

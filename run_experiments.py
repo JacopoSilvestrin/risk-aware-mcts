@@ -17,6 +17,10 @@ Output layout (one folder per (env, algo, beta, n_iter) "cell"):
             exp_data.json    {config, f_vals, seeds, ...} -- same double-encoded format as the simulate_* scripts,
                              so merge_exps.py and the notebooks (json.loads(json.load(f))["f_vals"]) keep working
             run.log          one line per episode: seed, f_val, seconds
+            decisions.jsonl  erm-mcts only: one JSON line per episode {seed, f_val, steps}; each step records the
+                             executed root action, the most-visited and the min-ERM root actions, whether those two
+                             agree, and every root action's visits and empirical ERM (None if unvisited).
+                             manifest.json gets criteria_{total,disagree}_steps and criteria_disagree_rate.
 
 Environments (SWEEP["envs"]): env name -> horizon H, or a dict {"H": ..., "gamma": ..., <env kwargs>}.
   - any name in envs.envs.MDPs (explicit MDPs; gamma comes from the MDP; all three algorithms available)
@@ -30,7 +34,8 @@ every mcts.learn()), so all algorithms share the same initial state and, on the 
 real transitions. On "binpacking" the item sequence is shared, but crush/spill draws (np.random inside step) only
 happen on some branches, so those are only partly common across algorithms.
 
-Note: K_ucb (sqrt(2)) and the ERM-MCTS best-action criterion ("min_erm") are fixed defaults here; they are not swept.
+Note: K_ucb (sqrt(2)) and the ERM-MCTS best-action criterion (ERMMCTS's best_action_criterion default) are fixed
+here; they are not swept. Both criteria's candidate actions are logged in decisions.jsonl, whichever one is executed.
 The MCTS episode loops below mirror simulate_erm_mcts.py / simulate_mcts_accrued_costs.py but work for any env.
 """
 
@@ -204,7 +209,8 @@ def _isolated_learn(mcts, n_iters):
 
 
 def simulate_erm_mcts(env, H, erm_beta, n_iter):
-    """One ERM-MCTS episode; returns the discounted cumulative cost."""
+    """One ERM-MCTS episode; returns (discounted cumulative cost, decisions), where decisions has one
+    record per real step with the most-visited and min-ERM root actions next to the executed one."""
     K_ucb = np.sqrt(2)
 
     def new_tree(state, root_depth):
@@ -214,9 +220,21 @@ def simulate_erm_mcts(env, H, erm_beta, n_iter):
     state = env.sample_initial_state()
     mcts = new_tree(state, 0)
     total = 0.0
+    decisions = []
     for t in range(H):
         _isolated_learn(mcts, n_iter)
+        stats = mcts.root_action_stats()
         action = mcts.best_action()
+        decisions.append({"t": t,
+                          # MDP state id; None for binpacking, whose state is a feature vector
+                          "state": state["state"] if np.isscalar(state["state"]) else None,
+                          "executed": action,
+                          "most_visited": stats["most_visited"],
+                          "min_erm": stats["min_erm"],
+                          "agree": bool(stats["most_visited"] == stats["min_erm"]),
+                          "actions": stats["actions"],
+                          "visits": stats["visits"],
+                          "erms": stats["erms"]})
         state, cost, terminated = env.step(state, action)
         total += cost * env.gamma ** t
         if terminated:
@@ -225,7 +243,7 @@ def simulate_erm_mcts(env, H, erm_beta, n_iter):
             mcts.set_root_depth(t + 1)
         else:
             mcts = new_tree(state, t + 1)  # next state not in the tree: rebuild it
-    return total
+    return total, decisions
 
 
 def simulate_acc_mcts(env, H, erm_beta, n_iter):
@@ -267,16 +285,17 @@ def run_episode(args):
     H, beta, n_iter = cell["H"], cell["erm_beta"], cell["n_iter"]
 
     # Keep any stray prints from the envs/algorithms out of the worker output.
+    decisions = None  # per-step most-visited vs min-ERM root actions, erm-mcts only
     with open(os.devnull, "w") as devnull, \
             contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
         if cell["algo"] == "erm-mcts":
-            f_val = simulate_erm_mcts(build_env(cell), H, beta, n_iter)
+            f_val, decisions = simulate_erm_mcts(build_env(cell), H, beta, n_iter)
         elif cell["algo"] == "acc-mcts":
             f_val = simulate_acc_mcts(build_accrued_env(cell), H, beta, n_iter)
         else:  # erm-bi
             f_val = _rollout_bi_policy(build_env(cell), H, bi_policy)
 
-    return seed, float(f_val), time.time() - t0
+    return seed, float(f_val), time.time() - t0, decisions
 
 
 # --------------------------------------------------------------------------------------
@@ -337,12 +356,22 @@ def run_cell(pool, cell, cell_dir, seeds):
 
     t0 = time.time()
     f_vals = []
-    with open(os.path.join(cell_dir, "run.log"), "w") as run_log:
+    n_steps = n_disagree = 0
+    log_decisions = cell["algo"] == "erm-mcts"
+    with open(os.path.join(cell_dir, "run.log"), "w") as run_log, \
+            (open(os.path.join(cell_dir, "decisions.jsonl"), "w") if log_decisions
+             else contextlib.nullcontext()) as decisions_log:
         # imap is ordered: f_vals[i] always corresponds to seeds[i].
-        for seed, f_val, secs in pool.imap(run_episode, [(cell, s, bi_policy) for s in seeds]):
+        for seed, f_val, secs, decisions in pool.imap(run_episode, [(cell, s, bi_policy) for s in seeds]):
             f_vals.append(f_val)
             run_log.write(f"seed={seed} f_val={f_val:.10g} seconds={secs:.3f}\n")
             run_log.flush()
+            if log_decisions:
+                n_steps += len(decisions)
+                n_disagree += sum(not d["agree"] for d in decisions)
+                decisions_log.write(json.dumps({"seed": seed, "f_val": f_val, "steps": decisions},
+                                               cls=acc.NumpyEncoder) + "\n")
+                decisions_log.flush()
 
     exp_data = {
         "config": cell,
@@ -358,10 +387,14 @@ def run_cell(pool, cell, cell_dir, seeds):
     with open(os.path.join(cell_dir, "exp_data.json"), "w") as f:
         json.dump(json.dumps(exp_data, cls=acc.NumpyEncoder), f)
 
-    return {"seconds": time.time() - t0,
-            "mean": float(np.mean(f_vals)),
-            "std": float(np.std(f_vals)),
-            "erm": empirical_erm(f_vals, cell["erm_beta"])}
+    stats = {"seconds": time.time() - t0,
+             "mean": float(np.mean(f_vals)),
+             "std": float(np.std(f_vals)),
+             "erm": empirical_erm(f_vals, cell["erm_beta"])}
+    if log_decisions:
+        stats.update(criteria_total_steps=n_steps, criteria_disagree_steps=n_disagree,
+                     criteria_disagree_rate=n_disagree / n_steps if n_steps else None)
+    return stats
 
 
 def _print_table(logger, manifest):
@@ -429,8 +462,12 @@ def main(cfg, data_folder_path=None, resume_dir=None, num_processors=None):
                 stats = run_cell(pool, cell, cell_dir, seeds)
                 entry.update(stats, status="done")
                 entry.pop("error", None)
+                criteria = ""
+                if stats.get("criteria_total_steps"):
+                    criteria = (f" most_visited!=min_erm at {stats['criteria_disagree_steps']}/"
+                                f"{stats['criteria_total_steps']} steps")
                 logger.info(f"[{k}/{len(cells)}] done in {stats['seconds']:.1f}s: mean={stats['mean']:.4f} "
-                            f"std={stats['std']:.4f} erm={stats['erm']:.4f}")
+                            f"std={stats['std']:.4f} erm={stats['erm']:.4f}{criteria}")
             except Exception as e:
                 entry.update(status="failed", error=f"{type(e).__name__}: {e}")
                 logger.info(f"[{k}/{len(cells)}] FAILED: {cell['name']}\n{traceback.format_exc()}")
