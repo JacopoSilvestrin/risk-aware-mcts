@@ -3,7 +3,7 @@
 #
 # Run it from the repo checkout on the cluster's shared filesystem, after editing SWEEP in run_experiments.py:
 #
-#   ./run_sweep_slurm.sh                                   # new sweep, 50 CPUs on gaips_phd
+#   ./run_sweep_slurm.sh                                   # new sweep, 50 CPUs on gaips_cpu_medium
 #   ./run_sweep_slurm.sh --cpus 32 --time 48:00:00 --base-seed 3 --name highbeta
 #   ./run_sweep_slurm.sh --resume data/sweep_demo_...      # finish a sweep interrupted by the time limit
 #
@@ -18,7 +18,7 @@ set -e
 
 REPO_DIR=$(cd "$(dirname "$0")" && pwd)
 DATA_DIR=$REPO_DIR/data
-PARTITION=gaips_phd
+PARTITION=gaips_cpu_medium                # CPU-only; gaips partitions without "cpu" require --gres=gpu
 CPUS=50
 TIME=96:00:00
 MEM=

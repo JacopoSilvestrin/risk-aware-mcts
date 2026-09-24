@@ -54,7 +54,7 @@ but the crush/spill draws only happen on some branches, so those are only partly
 after editing `SWEEP`:
 
 ```
-./run_sweep_slurm.sh                                         # 50 CPUs, partition gaips_phd, 96h
+./run_sweep_slurm.sh                                         # 50 CPUs, partition gaips_cpu_medium, 96h
 ./run_sweep_slurm.sh --cpus 32 --time 48:00:00 --mem 64G --base-seed 3 --name highbeta
 ./run_sweep_slurm.sh --resume data/sweep_demo_...            # finish a sweep that hit the time limit
 ```
