@@ -59,7 +59,10 @@ after editing `SWEEP`:
 ./run_sweep_slurm.sh --resume data/sweep_demo_...            # finish a sweep that hit the time limit
 ```
 
-The job copies the repo to `/scratch/slurm-jobs/$SLURM_JOB_ID`, builds a venv from `requirements.txt`, and runs with
-`--num-processors $SLURM_CPUS_PER_TASK`, so the pool size always matches the CPUs requested. Results go straight to
-`--data-dir` (default `<repo>/data`) on the shared filesystem, and the job's stdout goes to
-`slurm_logs/sweep-<jobid>.out`.
+The job copies the repo to `/scratch/slurm-jobs/$SLURM_JOB_ID` and builds a fresh Python 3.8 env there with conda
+(`--python` and `--conda` to change the version or the conda binary; the default conda is `$CONDA_EXE` or
+`~/miniconda3/bin/conda`), then installs `requirements.txt`. Conda's package cache and the env stay on the node's
+scratch disk, so nothing is installed on `/cfs` and no conda env needs to exist or be activated before submitting.
+Setup takes under a minute. The sweep runs with `--num-processors $SLURM_CPUS_PER_TASK`, so the pool size always
+matches the CPUs requested. Results go straight to `--data-dir` (default `<repo>/data`) on the shared filesystem, and
+the job's stdout (including the env setup) goes to `slurm_logs/sweep-<jobid>.out`.
