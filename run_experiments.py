@@ -17,9 +17,11 @@ Output layout (one folder per (env, algo, beta, n_iter, K_ucb) "cell"):
             exp_data.json    {config, f_vals, seeds, ...} -- same double-encoded format as the simulate_* scripts,
                              so merge_exps.py and the notebooks (json.loads(json.load(f))["f_vals"]) keep working
             run.log          one line per episode: seed, f_val, seconds
-            decisions.jsonl  erm-mcts only: one JSON line per episode {seed, f_val, steps}; each step records the
-                             executed root action, the most-visited and the min-ERM root actions, whether those two
-                             agree, and every root action's visits and empirical ERM (None if unvisited).
+            decisions.jsonl  erm-mcts and acc-mcts: one JSON line per episode {seed, f_val, steps}; each step records
+                             the executed root action, the most-visited and the min-ERM root actions, whether those
+                             two agree, and every root action's visits and empirical ERM (None if unvisited).
+                             acc-mcts steps also have mean_rewards, the raw -mean(exp(beta * cost)) its UCB uses
+                             (its ERMs are of the whole episode cost, incl. costs already accrued at the root).
                              manifest.json gets criteria_{total,disagree}_steps and criteria_disagree_rate.
 
 Environments (SWEEP["envs"]): env name -> horizon H, or a dict {"H": ..., "gamma": ..., <env kwargs>}.
@@ -260,22 +262,54 @@ def simulate_erm_mcts(env, H, erm_beta, n_iter, K_ucb):
     return total, decisions
 
 
+def _acc_root_stats(mcts, erm_beta):
+    """acc-mcts's root children statistics, in the same format as ERMMCTS.root_action_stats() plus
+    "mean_rewards" (cumulative_reward / visits = -mean(exp(beta * cost)), the raw value its UCB uses).
+    "erms" reads that back in cost units, (1/beta) * log(-mean_reward). Uses no randomness."""
+    children = list(mcts.root.children.values())
+    visits = [node.visits for node in children]
+    mean_rewards = [node.cumulative_reward / node.visits if node.visits > 0 else None for node in children]
+    erms = [np.log(-m) / erm_beta if m is not None else np.inf for m in mean_rewards]
+    return {
+        "actions": [node.action for node in children],
+        "visits": visits,
+        "mean_rewards": [float(m) if m is not None else None for m in mean_rewards],
+        "erms": [float(e) if np.isfinite(e) else None for e in erms],
+        "most_visited": children[np.argmax(visits)].action,
+        "min_erm": children[np.argmin(erms)].action,
+    }
+
+
 def simulate_acc_mcts(env, H, erm_beta, n_iter, K_ucb):
-    """One acc-mcts episode on the accrued-cost env; returns the discounted cumulative cost."""
+    """One acc-mcts episode on the accrued-cost env; returns (discounted cumulative cost, decisions), with
+    decisions in the same format as simulate_erm_mcts's plus each root action's mean_rewards."""
     def new_tree(state):
         return MCTS(initial_state=state, env=env, K_ucb=K_ucb, erm_beta=erm_beta, rollout_policy=None)
 
     state = env.sample_initial_state()
     mcts = new_tree(state)
+    decisions = []
     for t in range(H):
         _isolated_learn(mcts, n_iter)
+        stats = _acc_root_stats(mcts, erm_beta)
         action = mcts.best_action()
+        decisions.append({"t": t,
+                          # MDP state id; None for binpacking, whose state is a feature vector
+                          "state": state["state"] if np.isscalar(state["state"]) else None,
+                          "executed": action,
+                          "most_visited": stats["most_visited"],
+                          "min_erm": stats["min_erm"],
+                          "agree": bool(stats["most_visited"] == stats["min_erm"]),
+                          "actions": stats["actions"],
+                          "visits": stats["visits"],
+                          "erms": stats["erms"],
+                          "mean_rewards": stats["mean_rewards"]})
         state, _, terminated = env.step(state, action)
         if terminated:
             break
         if not mcts.update_root_node(action, state):
             mcts = new_tree(state)
-    return state["accrued_costs"]
+    return state["accrued_costs"], decisions
 
 
 def _rollout_bi_policy(env, H, policy):
@@ -297,13 +331,13 @@ def run_episode(args):
     H, beta, n_iter, K_ucb = cell["H"], cell["erm_beta"], cell["n_iter"], cell["K_ucb"]
 
     # Keep any stray prints from the envs/algorithms out of the worker output.
-    decisions = None  # per-step most-visited vs min-ERM root actions, erm-mcts only
+    decisions = None  # per-step most-visited vs min-ERM root actions, erm-mcts and acc-mcts only
     with open(os.devnull, "w") as devnull, \
             contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
         if cell["algo"] == "erm-mcts":
             f_val, decisions = simulate_erm_mcts(build_env(cell), H, beta, n_iter, K_ucb)
         elif cell["algo"] == "acc-mcts":
-            f_val = simulate_acc_mcts(build_accrued_env(cell), H, beta, n_iter, K_ucb)
+            f_val, decisions = simulate_acc_mcts(build_accrued_env(cell), H, beta, n_iter, K_ucb)
         else:  # erm-bi
             f_val = _rollout_bi_policy(build_env(cell), H, bi_policy)
 
@@ -369,7 +403,7 @@ def run_cell(pool, cell, cell_dir, seeds):
     t0 = time.time()
     f_vals = []
     n_steps = n_disagree = 0
-    log_decisions = cell["algo"] == "erm-mcts"
+    log_decisions = cell["algo"] in ("erm-mcts", "acc-mcts")
     with open(os.path.join(cell_dir, "run.log"), "w") as run_log, \
             (open(os.path.join(cell_dir, "decisions.jsonl"), "w") if log_decisions
              else contextlib.nullcontext()) as decisions_log:
