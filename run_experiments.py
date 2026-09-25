@@ -1,5 +1,5 @@
 """
-Sweep runner: environments x algorithms x erm_betas x n_iter_per_timestep, all evaluated on the
+Sweep runner: environments x algorithms x erm_betas x n_iter_per_timestep x K_ucb, all evaluated on the
 SAME seeded episodes so that results are paired and comparable across cells.
 
 Usage:
@@ -7,7 +7,7 @@ Usage:
     python run_experiments.py --base-seed 3            # different (but still shared) set of episode seeds
     python run_experiments.py --resume data/sweep_...  # finish an interrupted sweep (uses its saved config)
 
-Output layout (one folder per (env, algo, beta, n_iter) "cell"):
+Output layout (one folder per (env, algo, beta, n_iter, K_ucb) "cell"):
 
     data/sweep_<name>_<timestamp>_seed<base_seed>/
         sweep_config.json    exact SWEEP used, git commit, start / resume times
@@ -27,15 +27,19 @@ Environments (SWEEP["envs"]): env name -> horizon H, or a dict {"H": ..., "gamma
   - "binpacking": envs/binpacking_env_sequential.BinPackingEnv (gamma default 1, extra keys such as "num_bags" go to
     the constructor; no explicit MDP, so "erm-bi" is skipped for it)
 
-Seeding: episode i of EVERY cell uses seed 1000 * base_seed + i (independent of env, algo, beta, n_iter), and both
+Seeding: episode i of EVERY cell uses seed 1000 * base_seed + i (independent of env, algo, beta, n_iter, K), and both
 np.random and Python's random are seeded inside the worker at the start of the episode. f_vals[i] therefore refers to
 the same seed in every cell. Planning never consumes the real-step random streams (both are saved/restored around
 every mcts.learn()), so all algorithms share the same initial state and, on the MDPs, the same random numbers for the
 real transitions. On "binpacking" the item sequence is shared, but crush/spill draws (np.random inside step) only
 happen on some branches, so those are only partly common across algorithms.
 
-Note: K_ucb (sqrt(2)) and the ERM-MCTS best-action criterion (ERMMCTS's best_action_criterion default) are fixed
-here; they are not swept. Both criteria's candidate actions are logged in decisions.jsonl, whichever one is executed.
+K_ucb (SWEEP["K_ucbs"], UCB exploration constant) is swept for erm-mcts and acc-mcts; erm-bi ignores it. Cell names get
+a _K_<value> suffix. A config without "K_ucbs" (sweeps made before it existed, e.g. on --resume) uses K_ucb = sqrt(2)
+and keeps the old cell names. Note that the same K means different exploration for the two algorithms: erm-mcts's UCB
+works in ERM cost units, acc-mcts's in raw exp(beta * cost) units.
+
+Note: the ERM-MCTS best-action criterion (ERMMCTS's best_action_criterion default) is fixed here; it is not swept. Both criteria's candidate actions are logged in decisions.jsonl, whichever one is executed.
 The MCTS episode loops below mirror simulate_erm_mcts.py / simulate_mcts_accrued_costs.py but work for any env.
 """
 
@@ -66,6 +70,7 @@ import simulate_mcts_accrued_costs as acc  # AccruedCosts_MDP, _safe_exp, NumpyE
 DATA_FOLDER_PATH = str(pathlib.Path(__file__).parent / "data") + "/"
 
 ALGOS = ("erm-mcts", "acc-mcts", "erm-bi")
+DEFAULT_K_UCB = float(np.sqrt(2))  # used when a config has no "K_ucbs"
 
 SWEEP = {
     "name": "demo",
@@ -74,9 +79,10 @@ SWEEP = {
              #"two_paths_mdp": 15, #ALWAYS USE H=15 FOR GRID-MDP
              "binpacking": {"H": 5, "gamma": 1, "num_bags": 5}
              },
-    "algos": ["erm-mcts"], #["erm-mcts", "acc-mcts", "erm-bi"],
-    "erm_betas": [0.001, 1, 25],
+    "algos": ["erm-mcts", "acc-mcts"], #["erm-mcts", "acc-mcts", "erm-bi"],
+    "erm_betas": [1e-6, 1, 25],
     "n_iters": [2000],  # n_iter_per_timestep (ignored by "erm-bi", which runs once per (env, beta))
+    "K_ucbs": [0.1, 0.5, 1, 1.4142, 2, 5],  # UCB exploration constant (ignored by "erm-bi")
     "N": 100,                     # episodes per cell
     "base_seed": 0,
     "num_processors": 8,
@@ -118,18 +124,21 @@ def parse_env_spec(env, spec):
     return H, gamma, kwargs
 
 
-def cell_name(cell):
+def cell_name(cell, with_k):
     n_iter = "NA" if cell["n_iter"] is None else cell["n_iter"]
     name = (f"{cell['env']}_{cell['algo']}_gamma_{cell['gamma']}_beta_{cell['erm_beta']}"
             f"_niter_{n_iter}_H_{cell['H']}")
+    if with_k:  # False for configs without "K_ucbs", so their cell names stay as they were
+        name += "_K_NA" if cell["K_ucb"] is None else f"_K_{cell['K_ucb']:g}"
     for key, value in sorted(cell["env_kwargs"].items()):  # e.g. _num_bags_5, so bag counts never collide
         name += f"_{key}_{value}"
     return name
 
 
 def expand_cells(cfg):
-    """Cartesian product env x algo x beta x n_iter. "erm-bi" ignores n_iter, so it gets a single
-    cell (n_iter=None) per (env, beta) instead of identical re-runs, and only exists for explicit MDPs."""
+    """Cartesian product env x algo x beta x n_iter x K_ucb. "erm-bi" ignores n_iter and K_ucb, so it gets a
+    single cell (n_iter=K_ucb=None) per (env, beta) instead of identical re-runs, and only exists for explicit MDPs."""
+    with_k = "K_ucbs" in cfg
     cells = []
     for env, spec in cfg["envs"].items():
         H, gamma, env_kwargs = parse_env_spec(env, spec)
@@ -137,10 +146,11 @@ def expand_cells(cfg):
             if algo == "erm-bi" and env_kind(env) != "mdp":
                 continue
             n_iters = [None] if algo == "erm-bi" else cfg["n_iters"]
-            for n_iter in n_iters:
+            K_ucbs = [None] if algo == "erm-bi" else cfg.get("K_ucbs", [DEFAULT_K_UCB])
+            for n_iter, K_ucb in itertools.product(n_iters, K_ucbs):
                 cell = {"env": env, "H": H, "gamma": gamma, "env_kwargs": env_kwargs, "algo": algo,
-                        "erm_beta": beta, "n_iter": n_iter}
-                cell["name"] = cell_name(cell)
+                        "erm_beta": beta, "n_iter": n_iter, "K_ucb": K_ucb}
+                cell["name"] = cell_name(cell, with_k)
                 cells.append(cell)
     return cells
 
@@ -151,6 +161,12 @@ def validate(cfg):
     for algo in cfg["algos"]:
         if algo not in ALGOS:
             raise ValueError(f"unknown algo {algo!r}; available: {ALGOS}")
+    if "K_ucbs" in cfg:
+        K_ucbs = cfg["K_ucbs"]
+        if not K_ucbs or any(not isinstance(k, (int, float)) or k <= 0 for k in K_ucbs):
+            raise ValueError(f"K_ucbs must be a non-empty list of positive numbers; got {K_ucbs!r}")
+        if len({f"{k:g}" for k in K_ucbs}) != len(K_ucbs):
+            raise ValueError(f"K_ucbs values must be distinct (as formatted in cell names): {K_ucbs!r}")
 
 
 # --------------------------------------------------------------------------------------
@@ -208,11 +224,9 @@ def _isolated_learn(mcts, n_iters):
     np.random.set_state(np_state)
 
 
-def simulate_erm_mcts(env, H, erm_beta, n_iter):
+def simulate_erm_mcts(env, H, erm_beta, n_iter, K_ucb):
     """One ERM-MCTS episode; returns (discounted cumulative cost, decisions), where decisions has one
     record per real step with the most-visited and min-ERM root actions next to the executed one."""
-    K_ucb = np.sqrt(2)
-
     def new_tree(state, root_depth):
         return ERMMCTS(initial_state=state, env=env, K_ucb=K_ucb, erm_beta=erm_beta,
                        rollout_policy=None, root_depth=root_depth)
@@ -246,10 +260,8 @@ def simulate_erm_mcts(env, H, erm_beta, n_iter):
     return total, decisions
 
 
-def simulate_acc_mcts(env, H, erm_beta, n_iter):
+def simulate_acc_mcts(env, H, erm_beta, n_iter, K_ucb):
     """One acc-mcts episode on the accrued-cost env; returns the discounted cumulative cost."""
-    K_ucb = np.sqrt(2)
-
     def new_tree(state):
         return MCTS(initial_state=state, env=env, K_ucb=K_ucb, erm_beta=erm_beta, rollout_policy=None)
 
@@ -282,16 +294,16 @@ def run_episode(args):
     t0 = time.time()
     np.random.seed(seed)
     random.seed(seed)
-    H, beta, n_iter = cell["H"], cell["erm_beta"], cell["n_iter"]
+    H, beta, n_iter, K_ucb = cell["H"], cell["erm_beta"], cell["n_iter"], cell["K_ucb"]
 
     # Keep any stray prints from the envs/algorithms out of the worker output.
     decisions = None  # per-step most-visited vs min-ERM root actions, erm-mcts only
     with open(os.devnull, "w") as devnull, \
             contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
         if cell["algo"] == "erm-mcts":
-            f_val, decisions = simulate_erm_mcts(build_env(cell), H, beta, n_iter)
+            f_val, decisions = simulate_erm_mcts(build_env(cell), H, beta, n_iter, K_ucb)
         elif cell["algo"] == "acc-mcts":
-            f_val = simulate_acc_mcts(build_accrued_env(cell), H, beta, n_iter)
+            f_val = simulate_acc_mcts(build_accrued_env(cell), H, beta, n_iter, K_ucb)
         else:  # erm-bi
             f_val = _rollout_bi_policy(build_env(cell), H, bi_policy)
 
@@ -381,6 +393,7 @@ def run_cell(pool, cell, cell_dir, seeds):
         "algo": cell["algo"],
         "erm_beta": cell["erm_beta"],
         "n_iter_per_timestep": cell["n_iter"],
+        "K_ucb": cell["K_ucb"],
         "H": cell["H"],
     }
     # Same double encoding as the simulate_* scripts (json.loads(json.load(f)) reads it back).
@@ -399,12 +412,14 @@ def run_cell(pool, cell, cell_dir, seeds):
 
 def _print_table(logger, manifest):
     rows = [c for c in manifest["cells"].values() if c["status"] == "done"]
-    rows.sort(key=lambda c: (c["env"], c["algo"], c["erm_beta"], c["n_iter"] or 0))
+    # manifests written before K_ucb was swept have no "K_ucb" key
+    rows.sort(key=lambda c: (c["env"], c["algo"], c["erm_beta"], c["n_iter"] or 0, c.get("K_ucb") or 0))
     logger.info("")
-    logger.info(f"{'env':<18}{'algo':<10}{'beta':>8}{'n_iter':>8}{'mean':>12}{'std':>10}{'ERM(f)':>12}")
+    logger.info(f"{'env':<18}{'algo':<10}{'beta':>8}{'n_iter':>8}{'K_ucb':>8}{'mean':>12}{'std':>10}{'ERM(f)':>12}")
     for c in rows:
         n_iter = "NA" if c["n_iter"] is None else c["n_iter"]
-        logger.info(f"{c['env']:<18}{c['algo']:<10}{c['erm_beta']:>8g}{str(n_iter):>8}"
+        K_ucb = "NA" if c.get("K_ucb") is None else f"{c['K_ucb']:g}"
+        logger.info(f"{c['env']:<18}{c['algo']:<10}{c['erm_beta']:>8g}{str(n_iter):>8}{K_ucb:>8}"
                     f"{c['mean']:>12.4f}{c['std']:>10.4f}{c['erm']:>12.4f}")
 
 
