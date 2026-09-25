@@ -75,14 +75,14 @@ DEFAULT_K_UCB = float(np.sqrt(2))  # used when a config has no "K_ucbs"
 SWEEP = {
     "name": "demo",
     # env name -> horizon H, or {"H": ..., "gamma": ..., <env kwargs>} (see module docstring)
-    "envs": {#"four_state_mdp": 20, #ALWAYS USE H=20 FOR GRID-MDP
-             #"two_paths_mdp": 15, #ALWAYS USE H=15 FOR GRID-MDP
-             "binpacking": {"H": 5, "gamma": 1, "num_bags": 5}
+    "envs": {"four_state_mdp": 20, #ALWAYS USE H=20 FOR GRID-MDP
+             "two_paths_mdp": 15, #ALWAYS USE H=15 FOR GRID-MDP
+             #"binpacking": {"H": 5, "gamma": 1, "num_bags": 5}
              },
     "algos": ["erm-mcts", "acc-mcts"], #["erm-mcts", "acc-mcts", "erm-bi"],
-    "erm_betas": [1e-6, 1, 25],
-    "n_iters": [2000],  # n_iter_per_timestep (ignored by "erm-bi", which runs once per (env, beta))
-    "K_ucbs": [0.1, 0.5, 1, 1.4142, 2, 5],  # UCB exploration constant (ignored by "erm-bi")
+    "erm_betas": [0.01, 1, 5, 25],
+    "n_iters": [5000],  # n_iter_per_timestep (ignored by "erm-bi", which runs once per (env, beta))
+    "K_ucbs": [0.1, 1, 10, 1e2, 1e3, 1e4],  # UCB exploration constant (ignored by "erm-bi")
     "N": 100,                     # episodes per cell
     "base_seed": 0,
     "num_processors": 8,

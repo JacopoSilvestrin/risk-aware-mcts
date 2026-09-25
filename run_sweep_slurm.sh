@@ -18,8 +18,8 @@ set -e
 
 REPO_DIR=$(cd "$(dirname "$0")" && pwd)
 DATA_DIR=$REPO_DIR/data
-PARTITION=gaips_cpu_medium                # CPU-only; gaips partitions without "cpu" require --gres=gpu
-CPUS=50
+PARTITION=gaips_cpu_high                # CPU-only; gaips partitions without "cpu" require --gres=gpu
+CPUS=20
 TIME=96:00:00
 MEM=
 PY_ARGS=
