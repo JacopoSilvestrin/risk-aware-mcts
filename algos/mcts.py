@@ -168,7 +168,8 @@ class MCTS:
         Selects the action to play from the current decision node.
 
         :param x: (DecisionNode) current decision node.
-        :return: (int) action.
+        :return: (int) action. Exact score ties (e.g. several unvisited children) are broken
+            uniformly at random, so no action is favoured by its position in the action list.
         """
         def scoring(k):
             if x.children[k].visits > 0:
@@ -177,7 +178,11 @@ class MCTS:
             else:
                 return np.inf
 
-        return max(x.children, key=scoring)
+        actions = list(x.children)
+        scores = [scoring(k) for k in actions]
+        best = max(scores)
+        tied = [k for k, s in zip(actions, scores) if s == best]
+        return tied[0] if len(tied) == 1 else tied[np.random.randint(len(tied))]
 
     def select_outcome(self, random_node: RandomNode):
         """
@@ -231,14 +236,16 @@ class MCTS:
 
     def best_action(self):
         """
-        Returns the most visited action.
+        Returns the most visited action. Visit-count ties go to the tied action with the highest
+        mean reward (= lowest empirical ERM, since the reward is -exp(erm_beta*cost)); this is
+        deterministic, so no randomness is consumed outside the planning phase.
 
         :return: (int) the best action according to the number of visits principle.
         """
-        number_of_visits_children = [node.visits for node in self.root.children.values()]
-        index_best_action = np.argmax(number_of_visits_children)
-
-        return list(self.root.children.values())[index_best_action].action
+        children = list(self.root.children.values())
+        visits = [node.visits for node in children]
+        tied = [node for node, v in zip(children, visits) if v == max(visits)]
+        return max(tied, key=lambda node: node.cumulative_reward / node.visits if node.visits > 0 else -np.inf).action
     
     def update_root_node(self, selected_action : int, new_state : dict):
         """

@@ -41,6 +41,11 @@ a _K_<value> suffix. A config without "K_ucbs" (sweeps made before it existed, e
 and keeps the old cell names. Note that the same K means different exploration for the two algorithms: erm-mcts's UCB
 works in ERM cost units, acc-mcts's in raw exp(beta * cost) units.
 
+Tie-breaking (both algorithms): during tree search, exact UCB score ties (e.g. unvisited children) are broken uniformly
+at random; when committing to the most-visited root action, visit-count ties go to the tied action with the lowest
+empirical ERM. Before this, ties went to the first action in the list, which made exploration-dominated cells (large K,
+where root visits split evenly) always play action 0.
+
 Note: the ERM-MCTS best-action criterion (ERMMCTS's best_action_criterion default) is fixed here; it is not swept. Both criteria's candidate actions are logged in decisions.jsonl, whichever one is executed.
 The MCTS episode loops below mirror simulate_erm_mcts.py / simulate_mcts_accrued_costs.py but work for any env.
 """
@@ -84,7 +89,7 @@ SWEEP = {
     "algos": ["erm-mcts", "acc-mcts"], #["erm-mcts", "acc-mcts", "erm-bi"],
     "erm_betas": [0.01, 1, 5, 25],
     "n_iters": [5000],  # n_iter_per_timestep (ignored by "erm-bi", which runs once per (env, beta))
-    "K_ucbs": [0.1, 1, 10, 1e2, 1e3, 1e4],  # UCB exploration constant (ignored by "erm-bi")
+    "K_ucbs": [0.01, 0.03, 0.1, 0.3, 1, 1.4142, 10, 1e2, 1e3, 1e4],  # UCB exploration constant (ignored by "erm-bi")
     "N": 100,                     # episodes per cell
     "base_seed": 0,
     "num_processors": 8,
@@ -275,7 +280,9 @@ def _acc_root_stats(mcts, erm_beta):
         "visits": visits,
         "mean_rewards": [float(m) if m is not None else None for m in mean_rewards],
         "erms": [float(e) if np.isfinite(e) else None for e in erms],
-        "most_visited": children[np.argmax(visits)].action,
+        # same visit-count tie-break as MCTS.best_action(): the tied action with the lowest ERM
+        "most_visited": children[min((i for i, v in enumerate(visits) if v == max(visits)),
+                                     key=lambda i: erms[i])].action,
         "min_erm": children[np.argmin(erms)].action,
     }
 

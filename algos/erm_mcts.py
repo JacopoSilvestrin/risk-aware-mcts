@@ -180,7 +180,8 @@ class ERMMCTS:
         :param x: (DecisionNode) current decision node.
         :param depth: (int) depth of decision node.
 
-        :return: (int) action.
+        :return: (int) action. Exact score ties (e.g. several unvisited children) are broken
+            uniformly at random, so no action is favoured by its position in the action list.
         """
         def scoring(k):
             if x.children[k].visits > 0:
@@ -189,7 +190,11 @@ class ERMMCTS:
             else:
                 return -np.inf
 
-        return min(x.children, key=scoring)
+        actions = list(x.children)
+        scores = [scoring(k) for k in actions]
+        best = min(scores)
+        tied = [k for k, s in zip(actions, scores) if s == best]
+        return tied[0] if len(tied) == 1 else tied[np.random.randint(len(tied))]
 
     def select_outcome(self, random_node: RandomNode):
         """
@@ -251,9 +256,8 @@ class ERMMCTS:
           risk-sensitive objective, since ERM is dominated by tail behavior and visit
           counts don't reliably track ERM ranking (unlike expected-value MCTS, where
           visit counts do track mean-value ranking).
-        - "most_visited": the most-visited child, regardless of its empirical ERM.
-          Legacy criterion (valid for expected-value MCTS, not for ERM) kept only to
-          reproduce old results.
+        - "most_visited": the most-visited child, regardless of its empirical ERM; ties in
+          visit count go to the tied child with the lowest empirical ERM.
 
         Regardless of the above, if erm_beta <= self.risk_neutral_beta_threshold (and the
         threshold isn't None), "most_visited" is used unconditionally -- see the constructor
@@ -274,6 +278,8 @@ class ERMMCTS:
 
         :return: (dict) "actions", "visits" and "erms" (empirical ERM at root_depth, None if
             unvisited), one entry per root child, plus the "most_visited" and "min_erm" actions.
+            "most_visited" breaks visit-count ties by the lowest empirical ERM among the tied
+            actions (deterministic, so no randomness is consumed outside the planning phase).
         """
         children = list(self.root.children.values())
         visits = [node.visits for node in children]
@@ -281,11 +287,12 @@ class ERMMCTS:
             self._estimate_erm(node.costs_list, self.root_depth) if node.visits > 0 else np.inf
             for node in children
         ]
+        most_visited = min((i for i, v in enumerate(visits) if v == max(visits)), key=lambda i: erms[i])
         return {
             "actions": [node.action for node in children],
             "visits": visits,
             "erms": [float(e) if np.isfinite(e) else None for e in erms],
-            "most_visited": children[np.argmax(visits)].action,
+            "most_visited": children[most_visited].action,
             "min_erm": children[np.argmin(erms)].action,
         }
     
