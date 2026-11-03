@@ -23,6 +23,16 @@ Output layout (one folder per (env, algo, beta, n_iter, K_ucb) "cell"):
                              acc-mcts steps also have mean_rewards, the raw -mean(exp(beta * cost)) its UCB uses
                              (its ERMs are of the whole episode cost, incl. costs already accrued at the root).
                              manifest.json gets criteria_{total,disagree}_steps and criteria_disagree_rate.
+                             On "binpacking" each step also has "events" (see below) and each line has the
+                             episode's total "events".
+
+Accident counts ("binpacking" only): every real step is classified by diffing the bags before and after env.step
+(the env is not changed, so no randomness is consumed): "crush" = items newly crushed, "spill" = new spill events,
+"contamination" = spill-vulnerable, uncrushed items hit by those spills (the same count the env charges
+CONTAMINATION_COST for). exp_data.json gets "event_counts": {"crush": [...], "spill": [...], "contamination": [...]},
+one entry per episode in the same order as "seeds" / "f_vals". manifest.json gets events_mean_<category>,
+events_any_rate (share of episodes with at least one accident) and, for erm-mcts, events_cost_mismatch_steps
+(steps whose cost is lower than the counted accidents imply; should be 0).
 
 Environments (SWEEP["envs"]): env name -> horizon H, or a dict {"H": ..., "gamma": ..., <env kwargs>}.
   - any name in envs.envs.MDPs (explicit MDPs; gamma comes from the MDP; all three algorithms available)
@@ -231,9 +241,50 @@ def _isolated_learn(mcts, n_iters):
     np.random.set_state(np_state)
 
 
+EVENT_CATEGORIES = ("crush", "spill", "contamination")
+
+
+def _binpacking_step_events(state_before, state_after, action):
+    """Accidents caused by one real binpacking step, found by diffing the bag snapshots (env.step copies the
+    bags, so state_before is untouched). None for envs without bags (the MDPs)."""
+    if "bags" not in state_before:
+        return None
+    before, after = state_before["bags"], state_after["bags"]
+    crush = (sum(it.is_crushed for b in after for it in b.items)
+             - sum(it.is_crushed for b in before for it in b.items))
+    spill = sum(b.spilled_count for b in after) - sum(b.spilled_count for b in before)
+    contamination = 0
+    if spill:
+        # The env appends the new item after the spill checks, so the bag's old items are after.items[:-1],
+        # in the same order as before.items. Per spill it charges every spill-vulnerable, uncrushed item in
+        # the bag other than the spilling one (envs/binpacking_env_sequential.py, BinPackingEnv.step).
+        old_items = after[action].items[:-1]
+        for it_before, it_after in zip(before[action].items, old_items):
+            if it_after.is_spilled and not it_before.is_spilled:
+                contamination += sum(1 for it in old_items
+                                     if it.spill_vulnerable and not it.is_crushed and it is not it_after)
+    return {"crush": int(crush), "spill": int(spill), "contamination": int(contamination)}
+
+
+def _add_events(total, events):
+    if events is None:
+        return total
+    total = total or {c: 0 for c in EVENT_CATEGORIES}
+    return {c: total[c] + events[c] for c in EVENT_CATEGORIES}
+
+
+def _events_cost_mismatch(env, events, cost):
+    """True if a binpacking step's cost is lower than its counted accidents alone would cost (the rest of the cost
+    is illegal-move / bag-open), i.e. the diffing and the env disagree."""
+    accident_cost = (events["crush"] * env.crush_cost + events["spill"] * env.spill_cost
+                     + events["contamination"] * env.contamination_cost)
+    return cost < accident_cost - 1e-9
+
+
 def simulate_erm_mcts(env, H, erm_beta, n_iter, K_ucb):
-    """One ERM-MCTS episode; returns (discounted cumulative cost, decisions), where decisions has one
-    record per real step with the most-visited and min-ERM root actions next to the executed one."""
+    """One ERM-MCTS episode; returns (discounted cumulative cost, decisions, events, n_cost_mismatch), where
+    decisions has one record per real step with the most-visited and min-ERM root actions next to the executed
+    one, and events the episode's accident counts (None on the MDPs)."""
     def new_tree(state, root_depth):
         return ERMMCTS(initial_state=state, env=env, K_ucb=K_ucb, erm_beta=erm_beta,
                        rollout_policy=None, root_depth=root_depth)
@@ -242,6 +293,8 @@ def simulate_erm_mcts(env, H, erm_beta, n_iter, K_ucb):
     mcts = new_tree(state, 0)
     total = 0.0
     decisions = []
+    episode_events = None
+    n_cost_mismatch = 0
     for t in range(H):
         _isolated_learn(mcts, n_iter)
         stats = mcts.root_action_stats()
@@ -256,15 +309,21 @@ def simulate_erm_mcts(env, H, erm_beta, n_iter, K_ucb):
                           "actions": stats["actions"],
                           "visits": stats["visits"],
                           "erms": stats["erms"]})
+        prev_state = state
         state, cost, terminated = env.step(state, action)
         total += cost * env.gamma ** t
+        events = _binpacking_step_events(prev_state, state, action)
+        if events is not None:
+            decisions[-1]["events"] = events
+            episode_events = _add_events(episode_events, events)
+            n_cost_mismatch += _events_cost_mismatch(env, events, cost)
         if terminated:
             break
         if mcts.update_root_node(action, state):
             mcts.set_root_depth(t + 1)
         else:
             mcts = new_tree(state, t + 1)  # next state not in the tree: rebuild it
-    return total, decisions
+    return total, decisions, episode_events, n_cost_mismatch
 
 
 def _acc_root_stats(mcts, erm_beta):
@@ -288,7 +347,7 @@ def _acc_root_stats(mcts, erm_beta):
 
 
 def simulate_acc_mcts(env, H, erm_beta, n_iter, K_ucb):
-    """One acc-mcts episode on the accrued-cost env; returns (discounted cumulative cost, decisions), with
+    """One acc-mcts episode on the accrued-cost env; returns (discounted cumulative cost, decisions, events), with
     decisions in the same format as simulate_erm_mcts's plus each root action's mean_rewards."""
     def new_tree(state):
         return MCTS(initial_state=state, env=env, K_ucb=K_ucb, erm_beta=erm_beta, rollout_policy=None)
@@ -296,6 +355,7 @@ def simulate_acc_mcts(env, H, erm_beta, n_iter, K_ucb):
     state = env.sample_initial_state()
     mcts = new_tree(state)
     decisions = []
+    episode_events = None
     for t in range(H):
         _isolated_learn(mcts, n_iter)
         stats = _acc_root_stats(mcts, erm_beta)
@@ -311,12 +371,17 @@ def simulate_acc_mcts(env, H, erm_beta, n_iter, K_ucb):
                           "visits": stats["visits"],
                           "erms": stats["erms"],
                           "mean_rewards": stats["mean_rewards"]})
+        prev_state = state
         state, _, terminated = env.step(state, action)
+        events = _binpacking_step_events(prev_state, state, action)
+        if events is not None:
+            decisions[-1]["events"] = events
+            episode_events = _add_events(episode_events, events)
         if terminated:
             break
         if not mcts.update_root_node(action, state):
             mcts = new_tree(state)
-    return state["accrued_costs"], decisions
+    return state["accrued_costs"], decisions, episode_events
 
 
 def _rollout_bi_policy(env, H, policy):
@@ -339,16 +404,18 @@ def run_episode(args):
 
     # Keep any stray prints from the envs/algorithms out of the worker output.
     decisions = None  # per-step most-visited vs min-ERM root actions, erm-mcts and acc-mcts only
+    events = None  # accident counts, binpacking only
+    n_cost_mismatch = 0
     with open(os.devnull, "w") as devnull, \
             contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
         if cell["algo"] == "erm-mcts":
-            f_val, decisions = simulate_erm_mcts(build_env(cell), H, beta, n_iter, K_ucb)
+            f_val, decisions, events, n_cost_mismatch = simulate_erm_mcts(build_env(cell), H, beta, n_iter, K_ucb)
         elif cell["algo"] == "acc-mcts":
-            f_val, decisions = simulate_acc_mcts(build_accrued_env(cell), H, beta, n_iter, K_ucb)
+            f_val, decisions, events = simulate_acc_mcts(build_accrued_env(cell), H, beta, n_iter, K_ucb)
         else:  # erm-bi
             f_val = _rollout_bi_policy(build_env(cell), H, bi_policy)
 
-    return seed, float(f_val), time.time() - t0, decisions
+    return seed, float(f_val), time.time() - t0, decisions, events, n_cost_mismatch
 
 
 # --------------------------------------------------------------------------------------
@@ -410,20 +477,33 @@ def run_cell(pool, cell, cell_dir, seeds):
     t0 = time.time()
     f_vals = []
     n_steps = n_disagree = 0
+    event_counts = {c: [] for c in EVENT_CATEGORIES}
+    has_events = False
+    n_cost_mismatch = 0
     log_decisions = cell["algo"] in ("erm-mcts", "acc-mcts")
     with open(os.path.join(cell_dir, "run.log"), "w") as run_log, \
             (open(os.path.join(cell_dir, "decisions.jsonl"), "w") if log_decisions
              else contextlib.nullcontext()) as decisions_log:
         # imap is ordered: f_vals[i] always corresponds to seeds[i].
-        for seed, f_val, secs, decisions in pool.imap(run_episode, [(cell, s, bi_policy) for s in seeds]):
+        for seed, f_val, secs, decisions, events, mismatch in pool.imap(
+                run_episode, [(cell, s, bi_policy) for s in seeds]):
             f_vals.append(f_val)
-            run_log.write(f"seed={seed} f_val={f_val:.10g} seconds={secs:.3f}\n")
+            n_cost_mismatch += mismatch
+            events_str = ""
+            if events is not None:
+                has_events = True
+                for c in EVENT_CATEGORIES:
+                    event_counts[c].append(events[c])
+                events_str = " " + " ".join(f"{c}={events[c]}" for c in EVENT_CATEGORIES)
+            run_log.write(f"seed={seed} f_val={f_val:.10g} seconds={secs:.3f}{events_str}\n")
             run_log.flush()
             if log_decisions:
                 n_steps += len(decisions)
                 n_disagree += sum(not d["agree"] for d in decisions)
-                decisions_log.write(json.dumps({"seed": seed, "f_val": f_val, "steps": decisions},
-                                               cls=acc.NumpyEncoder) + "\n")
+                record = {"seed": seed, "f_val": f_val, "steps": decisions}
+                if events is not None:
+                    record["events"] = events
+                decisions_log.write(json.dumps(record, cls=acc.NumpyEncoder) + "\n")
                 decisions_log.flush()
 
     exp_data = {
@@ -437,6 +517,8 @@ def run_cell(pool, cell, cell_dir, seeds):
         "K_ucb": cell["K_ucb"],
         "H": cell["H"],
     }
+    if has_events:
+        exp_data["event_counts"] = event_counts  # per category, one count per episode, aligned with seeds
     # Same double encoding as the simulate_* scripts (json.loads(json.load(f)) reads it back).
     with open(os.path.join(cell_dir, "exp_data.json"), "w") as f:
         json.dump(json.dumps(exp_data, cls=acc.NumpyEncoder), f)
@@ -448,6 +530,12 @@ def run_cell(pool, cell, cell_dir, seeds):
     if log_decisions:
         stats.update(criteria_total_steps=n_steps, criteria_disagree_steps=n_disagree,
                      criteria_disagree_rate=n_disagree / n_steps if n_steps else None)
+    if has_events:
+        counts = np.array([event_counts[c] for c in EVENT_CATEGORIES])  # (category, episode)
+        stats.update({f"events_mean_{c}": float(np.mean(event_counts[c])) for c in EVENT_CATEGORIES})
+        stats["events_any_rate"] = float(np.mean(counts[:2].sum(axis=0) > 0))  # >= 1 crush or spill
+        if cell["algo"] == "erm-mcts":
+            stats["events_cost_mismatch_steps"] = int(n_cost_mismatch)
     return stats
 
 
@@ -456,12 +544,15 @@ def _print_table(logger, manifest):
     # manifests written before K_ucb was swept have no "K_ucb" key
     rows.sort(key=lambda c: (c["env"], c["algo"], c["erm_beta"], c["n_iter"] or 0, c.get("K_ucb") or 0))
     logger.info("")
-    logger.info(f"{'env':<18}{'algo':<10}{'beta':>8}{'n_iter':>8}{'K_ucb':>8}{'mean':>12}{'std':>10}{'ERM(f)':>12}")
+    logger.info(f"{'env':<18}{'algo':<10}{'beta':>8}{'n_iter':>8}{'K_ucb':>8}{'mean':>12}{'std':>10}{'ERM(f)':>12}"
+                f"{'crush':>8}{'spill':>8}{'contam':>8}")
     for c in rows:
         n_iter = "NA" if c["n_iter"] is None else c["n_iter"]
         K_ucb = "NA" if c.get("K_ucb") is None else f"{c['K_ucb']:g}"
         logger.info(f"{c['env']:<18}{c['algo']:<10}{c['erm_beta']:>8g}{str(n_iter):>8}{K_ucb:>8}"
-                    f"{c['mean']:>12.4f}{c['std']:>10.4f}{c['erm']:>12.4f}")
+                    f"{c['mean']:>12.4f}{c['std']:>10.4f}{c['erm']:>12.4f}"
+                    + "".join(f"{c['events_mean_' + e]:>8.3f}" if "events_mean_" + e in c else f"{'':>8}"
+                              for e in EVENT_CATEGORIES))
 
 
 def main(cfg, data_folder_path=None, resume_dir=None, num_processors=None):
@@ -522,8 +613,16 @@ def main(cfg, data_folder_path=None, resume_dir=None, num_processors=None):
                 if stats.get("criteria_total_steps"):
                     criteria = (f" most_visited!=min_erm at {stats['criteria_disagree_steps']}/"
                                 f"{stats['criteria_total_steps']} steps")
+                events = ""
+                if "events_any_rate" in stats:
+                    events = (" events/episode: " + " ".join(f"{c}={stats['events_mean_' + c]:.3f}"
+                                                             for c in EVENT_CATEGORIES)
+                              + f" any={stats['events_any_rate']:.3f}")
                 logger.info(f"[{k}/{len(cells)}] done in {stats['seconds']:.1f}s: mean={stats['mean']:.4f} "
-                            f"std={stats['std']:.4f} erm={stats['erm']:.4f}{criteria}")
+                            f"std={stats['std']:.4f} erm={stats['erm']:.4f}{criteria}{events}")
+                if stats.get("events_cost_mismatch_steps"):
+                    logger.info(f"WARNING: {stats['events_cost_mismatch_steps']} steps cost less than their "
+                                f"counted accidents imply: accident counting disagrees with the env")
             except Exception as e:
                 entry.update(status="failed", error=f"{type(e).__name__}: {e}")
                 logger.info(f"[{k}/{len(cells)}] FAILED: {cell['name']}\n{traceback.format_exc()}")
